@@ -7,8 +7,6 @@ scheduler metadata and kernel page-walk use the same effective topk per query.
 
 A "half-migrated" state (kernel passes topk_length but scheduler does not) is the
 exact bug this contract detects.
-
-Reference: B1 commit 6dd5c0cc6e on v0.5.18_rel.
 """
 
 import ast
@@ -22,7 +20,9 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Locate repo root from this file (tests/ → aot/ → kernels/ → sglang/ → python/ → root)
 # ---------------------------------------------------------------------------
-_REPO_ROOT = Path(__file__).resolve().parents[5]  # python/sglang/kernels/aot/tests → root
+_REPO_ROOT = (
+    Path(__file__).resolve().parents[5]
+)  # python/sglang/kernels/aot/tests → root
 
 
 def _parse_file(rel_path: str) -> ast.Module:
@@ -35,7 +35,10 @@ def _parse_file(rel_path: str) -> ast.Module:
 def _find_function_def(tree: ast.Module, name: str) -> ast.FunctionDef:
     """Find a top-level or class-level function definition by name."""
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
             return node
     raise AssertionError(f"Function '{name}' not found in AST")
 
@@ -144,8 +147,8 @@ class TestTopkLengthNoneDefault(unittest.TestCase):
         # Find the default for topk_length
         args = func.args
         all_args = args.posonlyargs + args.args + args.kwonlyargs
-        defaults_for_args = (
-            [None] * (len(args.args) - len(args.defaults)) + list(args.defaults)
+        defaults_for_args = [None] * (len(args.args) - len(args.defaults)) + list(
+            args.defaults
         )
         # Also check kwonly defaults
         all_defaults = defaults_for_args + list(args.kw_defaults)
@@ -153,9 +156,7 @@ class TestTopkLengthNoneDefault(unittest.TestCase):
 
         for param, default in zip(all_params, all_defaults):
             if param.arg == "topk_length":
-                self.assertIsNotNone(
-                    default, "topk_length must have a default value"
-                )
+                self.assertIsNotNone(default, "topk_length must have a default value")
                 self.assertIsInstance(
                     default,
                     ast.Constant,
@@ -175,8 +176,8 @@ class TestTopkLengthNoneDefault(unittest.TestCase):
         func = _find_function_def(tree, "get_mla_metadata")
         args = func.args
         all_params = args.args + args.kwonlyargs
-        defaults_for_args = (
-            [None] * (len(args.args) - len(args.defaults)) + list(args.defaults)
+        defaults_for_args = [None] * (len(args.args) - len(args.defaults)) + list(
+            args.defaults
         )
         all_defaults = defaults_for_args + list(args.kw_defaults)
 
@@ -197,7 +198,9 @@ class TestFlashMLABackendUnaffected(unittest.TestCase):
 
     def test_flashmla_backend_no_topk_length(self):
         tree = _parse_file("python/sglang/srt/layers/attention/flashmla_backend.py")
-        has_topk_length = _find_call_with_keyword(tree, "get_mla_metadata", "topk_length")
+        has_topk_length = _find_call_with_keyword(
+            tree, "get_mla_metadata", "topk_length"
+        )
         self.assertFalse(
             has_topk_length,
             "flashmla_backend.py should NOT pass topk_length (dense attention path)",

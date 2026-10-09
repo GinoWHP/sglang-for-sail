@@ -4,10 +4,7 @@ Validates that on PPU SM80 (get_device_sm() < 89) **every** KPool indexer code
 path routes through INT8 APIs (int8_mqa_logits / int8_paged_mqa_logits /
 per_token_quant_int8) and never reaches FP8 counterparts genuinely.
 
-Migrated from v0.5.20_rel ``feat/glm-5.3-flash-migrate-0520`` (original source
-patch 022ea71d54 in v0.5.18_rel) and adapted to the v0.5.21 forms introduced by
-commits ``3efd3513fb`` (KPool INT8 routing + topk 128-align padding) and
-``304cbd73e2`` (FA3 INT8 fail-fast, CR Finding W5):
+The v0.5.21 forms validated here:
 
 - ``dsa_indexer_kpool.py`` uses an **instance flag** ``self.use_int8`` (set from
   ``get_device_sm() < 89 and is_ppu()``) instead of a module-level ``_is_ppu``
@@ -19,9 +16,6 @@ commits ``3efd3513fb`` (KPool INT8 routing + topk 128-align padding) and
 - FA3 INT8 KV-cache handling is a fail-fast ``ValueError``, not an up-cast copy.
 
 These tests operate purely on source text / AST – no GPU or CUDA required.
-
-Source patch: 022ea71d54 (v0.5.18_rel)
-Migration: 3efd3513fb + 304cbd73e2 (v0.5.21 branch feat/glm-5.3-flash-migrate-0521)
 """
 
 import ast
@@ -32,26 +26,43 @@ import unittest
 # ---------------------------------------------------------------------------
 # Locate source files
 # ---------------------------------------------------------------------------
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..")
-)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _PYTHON_ROOT = os.path.join(_REPO_ROOT, "python")
 
 _DSA_INDEXER_KPOOL = os.path.join(
     _PYTHON_ROOT,
-    "sglang", "srt", "layers", "attention", "dsa", "dsa_indexer_kpool.py",
+    "sglang",
+    "srt",
+    "layers",
+    "attention",
+    "dsa",
+    "dsa_indexer_kpool.py",
 )
 _KPOOL_FP8_INDEX = os.path.join(
     _PYTHON_ROOT,
-    "sglang", "srt", "layers", "attention", "dsa", "kpool_fp8_index.py",
+    "sglang",
+    "srt",
+    "layers",
+    "attention",
+    "dsa",
+    "kpool_fp8_index.py",
 )
 _DSA_BACKEND = os.path.join(
     _PYTHON_ROOT,
-    "sglang", "srt", "layers", "attention", "dsa_backend.py",
+    "sglang",
+    "srt",
+    "layers",
+    "attention",
+    "dsa_backend.py",
 )
 _PPU_FLASH_ATTN = os.path.join(
     _PYTHON_ROOT,
-    "sglang", "srt", "hardware_backend", "ppu", "attention", "flash_attention.py",
+    "sglang",
+    "srt",
+    "hardware_backend",
+    "ppu",
+    "attention",
+    "flash_attention.py",
 )
 
 
@@ -113,9 +124,7 @@ class TestDsaIndexerKpoolInt8Gate(unittest.TestCase):
             r"from\s+sglang\.srt\.utils\s+import\s+\(([^)]*)\)", re.DOTALL
         )
         match = pattern.search(self.src)
-        self.assertIsNotNone(
-            match, "sglang.srt.utils import block must exist"
-        )
+        self.assertIsNotNone(match, "sglang.srt.utils import block must exist")
         names = match.group(1)
         self.assertIn("is_ppu", names, "is_ppu must be imported")
         self.assertIn("get_device_sm", names, "get_device_sm must be imported")
@@ -178,8 +187,7 @@ class TestDsaIndexerKpoolInt8Gate(unittest.TestCase):
         self.assertRegex(
             self.src,
             pattern,
-            "Ragged MQA must early-return deep_gemm.int8_mqa_logits when "
-            "self.use_int8",
+            "Ragged MQA must early-return deep_gemm.int8_mqa_logits when self.use_int8",
         )
         self.assertEqual(
             self.src.count("deep_gemm.int8_mqa_logits"),
@@ -269,8 +277,7 @@ class TestKpoolFp8IndexInt8Kernels(unittest.TestCase):
         self.assertRegex(
             self.src,
             pattern,
-            "_kpool_quant_int8() must lazily return is_ppu() and "
-            "get_device_sm() < 89",
+            "_kpool_quant_int8() must lazily return is_ppu() and get_device_sm() < 89",
         )
         self.assertIn(
             "from sglang.srt.utils import get_device_sm, is_ppu",
@@ -328,12 +335,11 @@ class TestKpoolFp8IndexInt8Kernels(unittest.TestCase):
         for kernel_name in expected_kernels:
             with self.subTest(kernel=kernel_name):
                 start = self.src.find(f"def {kernel_name}(")
-                self.assertGreater(
-                    start, 0, f"{kernel_name} must exist"
-                )
+                self.assertGreater(start, 0, f"{kernel_name} must exist")
                 close = self.src.find("\n):", start)
                 self.assertGreater(
-                    close, start,
+                    close,
+                    start,
                     f"{kernel_name}: could not locate end of parameter block",
                 )
                 params = self.src[start:close]
@@ -397,12 +403,11 @@ class TestKpoolFp8IndexInt8Kernels(unittest.TestCase):
             # The cast must sit inside an `if QUANT_INT8:` branch (the fp8 path
             # stores the float value directly). The nearest preceding branch
             # header is at most 2 lines up (comment in between).
-            window = "\n".join(lines[max(0, i - 3):i])
+            window = "\n".join(lines[max(0, i - 3) : i])
             self.assertIn(
                 "if QUANT_INT8:",
                 window,
-                f"Line {i + 1}: round().to(tl.int8) must be guarded by "
-                f"if QUANT_INT8:",
+                f"Line {i + 1}: round().to(tl.int8) must be guarded by if QUANT_INT8:",
             )
         self.assertGreaterEqual(
             found,
@@ -450,8 +455,12 @@ class TestKpoolInt8CrossFileConsistency(unittest.TestCase):
 
     # 3a. Both files import is_ppu from sglang.srt.utils
     def test_both_files_import_is_ppu(self):
-        pattern = re.compile(r"from\s+sglang\.srt\.utils\s+import\s+.*\bis_ppu\b", re.DOTALL)
-        self.assertRegex(self.indexer_src, pattern, "dsa_indexer_kpool must import is_ppu")
+        pattern = re.compile(
+            r"from\s+sglang\.srt\.utils\s+import\s+.*\bis_ppu\b", re.DOTALL
+        )
+        self.assertRegex(
+            self.indexer_src, pattern, "dsa_indexer_kpool must import is_ppu"
+        )
         self.assertRegex(self.kpool_src, pattern, "kpool_fp8_index must import is_ppu")
 
     # 3b. Both files gate INT8 on the same SM80 PPU condition
@@ -470,29 +479,31 @@ class TestKpoolInt8CrossFileConsistency(unittest.TestCase):
     # 3c. The buffer dtype logic matches between indexer and kpool
     def test_buffer_dtype_consistency(self):
         indexer_has = (
-            "torch.int8 if self.use_int8 else torch.float8_e4m3fn"
-            in self.indexer_src
+            "torch.int8 if self.use_int8 else torch.float8_e4m3fn" in self.indexer_src
         )
         kpool_has = (
-            "torch.int8 if quant_int8 else torch.float8_e4m3fn"
-            in self.kpool_src
+            "torch.int8 if quant_int8 else torch.float8_e4m3fn" in self.kpool_src
         )
         self.assertTrue(indexer_has, "indexer must use conditional int8/fp8 dtype")
         self.assertTrue(kpool_has, "kpool must use conditional int8/fp8 dtype")
 
     # 3d. Quantization constant 127 appears in kpool Triton kernels
     def test_quant_127_in_kpool(self):
-        self.assertIn("127.0", self.kpool_src, "kpool must use 127.0 quantization constant")
+        self.assertIn(
+            "127.0", self.kpool_src, "kpool must use 127.0 quantization constant"
+        )
         self.assertIn("-127.0", self.kpool_src, "kpool must use -127.0 min constant")
 
     # 3e. Both files carry the PPU int8 migration annotations
     def test_patch_annotations(self):
         self.assertIn(
-            "# PPU int8:", self.indexer_src,
+            "# PPU int8:",
+            self.indexer_src,
             "indexer must carry PPU int8 migration annotations",
         )
         self.assertIn(
-            "# PPU int8:", self.kpool_src,
+            "# PPU int8:",
+            self.kpool_src,
             "kpool must carry PPU int8 migration annotations",
         )
 
@@ -532,7 +543,7 @@ class TestPpuFp8Isolation(unittest.TestCase):
             if "deep_gemm.fp8_paged_mqa_logits" in line:
                 self.assertIn(
                     "if self.use_int8",
-                    "\n".join(stripped.splitlines()[max(0, i - 6):i + 1]),
+                    "\n".join(stripped.splitlines()[max(0, i - 6) : i + 1]),
                     f"Line {i}: fp8_paged_mqa_logits reference is not guarded "
                     f"by self.use_int8: {line.strip()!r}",
                 )
@@ -615,7 +626,7 @@ class TestFlashMlaSparseTopk128Align(unittest.TestCase):
     def test_patch_annotation(self):
         anchor = self.src.find("if _is_ppu and page_table_1.shape[-1] % 128 != 0:")
         self.assertGreater(anchor, 0)
-        annotation = self.src[max(0, anchor - 500):anchor]
+        annotation = self.src[max(0, anchor - 500) : anchor]
         self.assertIn(
             "PPU int8:",
             annotation,
@@ -635,9 +646,7 @@ class TestFlashMlaSparseTopk128Align(unittest.TestCase):
     # 5f. Non-PPU path is untouched (no ungated 128 check)
     def test_padding_gated_on_ppu(self):
         stripped = _strip_comments(self.src)
-        unguarded = re.compile(
-            r"if\s+page_table_1\.shape\[-1\]\s*%\s*128\s*!=\s*0\s*:"
-        )
+        unguarded = re.compile(r"if\s+page_table_1\.shape\[-1\]\s*%\s*128\s*!=\s*0\s*:")
         self.assertIsNone(
             unguarded.search(stripped),
             "128-align check must never be applied without the _is_ppu gate "

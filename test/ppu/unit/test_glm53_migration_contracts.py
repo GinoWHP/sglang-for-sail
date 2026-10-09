@@ -1,24 +1,17 @@
-"""Static contract & dispatcher tests for GLM-5.3-Flash migration (v0.5.18 → v0.5.21).
+"""Static contract & dispatcher tests for GLM-5.3-Flash migration.
 
 These tests are designed to run on Mac/CPU without GPU/CUDA/PPU dependencies.
 They use AST analysis and monkeypatching instead of real imports where GPU
 extensions would be loaded at import time.
-
-Migrated from the v0.5.20 migration branch (commit 8f4fff8345 + later CR
-revisions) and adapted to the v0.5.21 APIs.
 
 Covers:
   - INT8 W8A8 MoE dispatcher: monkeypatch-driven branch selection
   - W8A8 INT8 MoE scheme: AST-level structural contract
   - GLM-5.3 MXFP4 weight-name mapper: behavioral test on real WeightsMapper
 
-Part 1 of the v0.5.20 source file (CP hybrid communicator AST contract on
-communicator_mhc_hybrid_cp.py) is intentionally omitted: the v0.5.20
-migration built a dedicated MHCHybridDSACPLayerCommunicator, but v0.5.21's
-layer_boundary system already provides the CP collectives natively (migrated
-commit 0f962b3247), so there is no equivalent module to contract-test.
-Part numbering is kept aligned with the v0.5.20 source file for
-cross-reference.
+The CP hybrid communicator AST contract is intentionally omitted: v0.5.21's
+layer_boundary system already provides the CP collectives natively, so there
+is no dedicated communicator module to contract-test.
 """
 
 import ast
@@ -34,9 +27,7 @@ from unittest.mock import patch
 # ---------------------------------------------------------------------------
 # Helper: locate python/ source root for AST analysis
 # ---------------------------------------------------------------------------
-_REPO_ROOT = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "..")
-)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _PYTHON_ROOT = os.path.join(_REPO_ROOT, "python")
 
 
@@ -51,6 +42,7 @@ def _has_npu_dynamic_quant() -> bool:
     """
     try:
         import torch
+
         return callable(getattr(torch.ops.npu, "npu_dynamic_quant", None))
     except Exception:
         return False
@@ -69,12 +61,9 @@ def _parse_module(rel_path: str) -> ast.Module:
 # ===================================================================
 # Part 1: CP hybrid communicator — N/A in v0.5.21 (intentionally omitted)
 # ===================================================================
-# The v0.5.20 migration (commit 21692be5ec) built a dedicated
-# MHCHybridDSACPLayerCommunicator in communicator_mhc_hybrid_cp.py and
-# contract-tested it with ScatterMode-based AST checks. v0.5.21's
-# layer_boundary system already provides the CP collectives natively
-# (migrated commit 0f962b3247), so no equivalent module exists and there
-# is nothing to contract-test here.
+# v0.5.21's layer_boundary system provides the CP collectives natively, so
+# there is no dedicated MHCHybridDSACPLayerCommunicator module to contract-test
+# here.
 
 
 # ===================================================================
@@ -87,8 +76,8 @@ class TestW8A8Int8MoEDispatcherSelection(unittest.TestCase):
       - PPU -> CompressedTensorsW8A8Int8MoE
       - Other -> NotImplementedError
 
-    [CR Warning 6 - real dispatch] 旧代码直接实例化 scheme 或手写 if/else 模拟。
-    改为 mock get_scheme_dict 旁路层名匹配，真正执行 get_moe_scheme 的生产分支。
+    Mocks get_scheme_dict to bypass layer-name matching so the real
+    get_moe_scheme production branch is exercised.
     """
 
     @classmethod
@@ -252,8 +241,13 @@ class TestW8A8Int8MoESchemeASTContract(unittest.TestCase):
             for node in ast.walk(cls_node)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        for expected in ("__init__", "create_weights", "process_weights_after_loading",
-                         "create_moe_runner", "apply_weights"):
+        for expected in (
+            "__init__",
+            "create_weights",
+            "process_weights_after_loading",
+            "create_moe_runner",
+            "apply_weights",
+        ):
             self.assertIn(expected, methods, f"Missing method: {expected}")
 
     def test_module_exports_only_the_scheme_class(self):
@@ -292,6 +286,7 @@ class TestW8A8Int8MoESchemeASTContract(unittest.TestCase):
 # Part 4: GLM-5.3 MXFP4 weight-name mapper — behavioral test
 # ===================================================================
 
+
 # --- Extract real WeightsMapper from AST (mirrors dspark test style) ---
 def _top_level(path):
     return ast.parse(path.read_text(encoding="utf-8")).body
@@ -299,7 +294,6 @@ def _top_level(path):
 
 def _compile_nodes(nodes, base_globals):
     """Compile AST nodes extracted from the checkout into a namespace."""
-    from pathlib import Path
 
     module = ast.Module(
         body=[
@@ -328,8 +322,7 @@ _utils_ns = _compile_nodes(
         or (
             isinstance(n, ast.Assign)
             and any(
-                isinstance(t, ast.Name) and t.id == "WeightsMapping"
-                for t in n.targets
+                isinstance(t, ast.Name) and t.id == "WeightsMapping" for t in n.targets
             )
         )
     ],
@@ -346,8 +339,7 @@ _WEIGHTS_MAPPER = _utils_ns["WeightsMapper"]
 _glm5_class = next(
     n
     for n in _top_level(_SGLANG_SRC / "srt/models/glm5_next.py")
-    if isinstance(n, ast.ClassDef)
-    and n.name == "Glm5NextForConditionalGeneration"
+    if isinstance(n, ast.ClassDef) and n.name == "Glm5NextForConditionalGeneration"
 )
 _glm5_attrs = {
     t.id: n
@@ -368,9 +360,7 @@ _GLM5_MAPPER = _glm5_mapper_ns["hf_to_sglang_mapper"]
 # --- Extract should_ignore_layer (best-effort, fallback to suffix matcher) ---
 _SHOULD_IGNORE_LAYER = None
 try:
-    _sil_path = (
-        _SGLANG_SRC / "srt/layers/quantization/compressed_tensors/utils.py"
-    )
+    _sil_path = _SGLANG_SRC / "srt/layers/quantization/compressed_tensors/utils.py"
     if _sil_path.is_file():
         _sil_ns = _compile_nodes(
             [
@@ -402,7 +392,7 @@ class TestGlm5NextMXFP4MapperBehavior(unittest.TestCase):
     """Behavioral test: real WeightsMapper.apply_list on combined paths.
 
     Validates the two-stage substr→prefix semantics required by the MXFP4
-    channelwise metadata remap (patch #5 1c8267b9fe).
+    channelwise metadata remap.
     """
 
     mapper = _GLM5_MAPPER
@@ -410,9 +400,7 @@ class TestGlm5NextMXFP4MapperBehavior(unittest.TestCase):
     # --- AST structural assertions (retained from Part 4 v1) ---
     def test_mapper_has_qkv_in_substr(self):
         self.assertIn("attn.qkv", self.mapper.orig_to_new_substr)
-        self.assertEqual(
-            self.mapper.orig_to_new_substr["attn.qkv"], "attn.qkv_proj"
-        )
+        self.assertEqual(self.mapper.orig_to_new_substr["attn.qkv"], "attn.qkv_proj")
 
     def test_mapper_has_prefixes(self):
         self.assertIn("model.language_model.", self.mapper.orig_to_new_prefix)
@@ -421,9 +409,7 @@ class TestGlm5NextMXFP4MapperBehavior(unittest.TestCase):
     # --- Combined path behavioral tests ---
     def test_visual_qkv_combined_path(self):
         """model.visual.blocks.0.attn.qkv → visual.blocks.0.attn.qkv_proj"""
-        result = self.mapper.apply_list(
-            ["model.visual.blocks.0.attn.qkv"]
-        )
+        result = self.mapper.apply_list(["model.visual.blocks.0.attn.qkv"])
         self.assertEqual(result, ["visual.blocks.0.attn.qkv_proj"])
 
     def test_language_model_qkv_combined_path(self):
@@ -441,16 +427,12 @@ class TestGlm5NextMXFP4MapperBehavior(unittest.TestCase):
 
     def test_prefix_only_no_qkv(self):
         """model.language_model.layers.0.mlp.gate_proj → model.layers.0.mlp.gate_proj"""
-        result = self.mapper.apply_list(
-            ["model.language_model.layers.0.mlp.gate_proj"]
-        )
+        result = self.mapper.apply_list(["model.language_model.layers.0.mlp.gate_proj"])
         self.assertEqual(result, ["model.layers.0.mlp.gate_proj"])
 
     def test_visual_prefix_only(self):
         """model.visual.patch_embed.proj.weight → visual.patch_embed.proj.weight"""
-        result = self.mapper.apply_list(
-            ["model.visual.patch_embed.proj.weight"]
-        )
+        result = self.mapper.apply_list(["model.visual.patch_embed.proj.weight"])
         self.assertEqual(result, ["visual.patch_embed.proj.weight"])
 
     def test_no_match_passthrough(self):
@@ -489,15 +471,11 @@ class TestGlm5NextMXFP4MapperBehavior(unittest.TestCase):
         )
         # The runtime module prefix for these layers:
         self.assertTrue(
-            _SHOULD_IGNORE_LAYER(
-                "model.layers.61.self_attn.qkv_proj", remapped
-            ),
+            _SHOULD_IGNORE_LAYER("model.layers.61.self_attn.qkv_proj", remapped),
             "should_ignore_layer must match after remap",
         )
         self.assertTrue(
-            _SHOULD_IGNORE_LAYER(
-                "visual.blocks.0.attn.qkv_proj", remapped
-            ),
+            _SHOULD_IGNORE_LAYER("visual.blocks.0.attn.qkv_proj", remapped),
             "should_ignore_layer must match after remap",
         )
 
@@ -509,7 +487,7 @@ class TestMhcAttentionCpGuardContract(unittest.TestCase):
     """AST contract for construction._bind_stage's MHC + attention-CP guard.
 
     v0.5.21 upstream raised NotImplementedError for any at-producer update
-    whose producer layout is sharded over ATTN_CP (commit 49b5e76e45). For
+    whose producer layout is sharded over ATTN_CP. For
     the GLM-5.3-Flash DSA prefill-CP path this blocked server startup with
     a full token shard over ATTN_CP, even though the transport is
     implemented (input gather in boundary._select_input_steps L415-430 /
@@ -526,9 +504,7 @@ class TestMhcAttentionCpGuardContract(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         rel = "sglang/srt/layers/layer_boundary/construction.py"
-        cls.source = (
-            _PYTHON_ROOT + "/" + rel
-        )
+        cls.source = _PYTHON_ROOT + "/" + rel
         with open(cls.source, "r") as fh:
             cls.source_text = fh.read()
         cls.tree = ast.parse(cls.source_text, filename=cls.source)
@@ -549,8 +525,7 @@ class TestMhcAttentionCpGuardContract(unittest.TestCase):
                     and exc.func.id == "NotImplementedError"
                     and exc.args
                     and isinstance(exc.args[0], ast.Constant)
-                    and exc.args[0].value
-                    == "MHC with a gather over attention CP"
+                    and exc.args[0].value == "MHC with a gather over attention CP"
                 ):
                     found.append(node)
         return found
@@ -561,9 +536,7 @@ class TestMhcAttentionCpGuardContract(unittest.TestCase):
     def test_guard_requires_attn_cp_membership(self):
         """The raise condition must still contain `ATTN_CP in gathers_over_cp`."""
         guard = self._guard_ifs()[0]
-        compares = [
-            n for n in ast.walk(guard.test) if isinstance(n, ast.Compare)
-        ]
+        compares = [n for n in ast.walk(guard.test) if isinstance(n, ast.Compare)]
         membership = [
             c
             for c in compares
@@ -573,16 +546,12 @@ class TestMhcAttentionCpGuardContract(unittest.TestCase):
             and isinstance(c.comparators[0], ast.Name)
             and c.comparators[0].id == "gathers_over_cp"
         ]
-        self.assertTrue(
-            membership, "guard must require ATTN_CP in gathers_over_cp"
-        )
+        self.assertTrue(membership, "guard must require ATTN_CP in gathers_over_cp")
 
     def test_guard_relaxes_exactly_attn_cp(self):
         """The raise condition must also require gathers_over_cp != {ATTN_CP}."""
         guard = self._guard_ifs()[0]
-        compares = [
-            n for n in ast.walk(guard.test) if isinstance(n, ast.Compare)
-        ]
+        compares = [n for n in ast.walk(guard.test) if isinstance(n, ast.Compare)]
         relaxed = [
             c
             for c in compares
@@ -603,8 +572,7 @@ class TestMhcAttentionCpGuardContract(unittest.TestCase):
     def test_original_guard_kept_as_comment(self):
         """The upstream condition is retained as a comment (change trace)."""
         self.assertIn(
-            '#     raise NotImplementedError("MHC with a gather over '
-            'attention CP")',
+            '#     raise NotImplementedError("MHC with a gather over attention CP")',
             self.source_text,
         )
         self.assertIn("# if (", self.source_text)
