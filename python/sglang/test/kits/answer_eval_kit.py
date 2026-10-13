@@ -194,7 +194,11 @@ SERVER_PARAMETER_CLI_ORDER = (
 # DeepSeek-V4 names are likewise declared in `sglang.srt.environ` and read on
 # the dsv4 path -- `SGLANG_OPT_USE_TOPK_V2` by the dsv4 attention layers and
 # `SGLANG_DSV4_FP4_EXPERTS` by `model_config.py` -- and the internal btv1.1
-# P0_daily case exports both for every serving of this checkpoint.  The internal
+# P0_daily case exports both for every serving of this checkpoint.
+# `SGLANG_OPT_FLASHMLA_SPARSE_PREFILL` is the same story on the mxfp4 side:
+# declared in `sglang.srt.environ` (EnvBool, default on), read by
+# `sglang.srt.layers.attention.deepseek_v4_backend`, and exported as 1 by the
+# internal btv1.5 answer case for DeepSeek-V4-Pro-0813.  The internal
 # GLM cases also export `SGLANG_NSA_DUAL_STREAM=0`, which is deliberately not
 # here: nothing in this tree reads that name, so accepting it would let a config
 # state a setting no run honours.
@@ -203,6 +207,7 @@ SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
     "SGLANG_OPT_USE_TOPK_V2",
     "SGLANG_DSV4_FP4_EXPERTS",
+    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL",
 }
 
 
