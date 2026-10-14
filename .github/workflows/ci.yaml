@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # The GITHUB_TOKEN's scopes narrow down the workflow_call chain, so the
+  # pr-gate job inside pr-test-ppu.yml needs this declared here to list
+  # workflow runs for its cooldown check.
+  actions: read
 
 concurrency:
   # Ignored review and unrelated-label events use a per-run suffix so they

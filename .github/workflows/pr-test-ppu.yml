@@ -34,6 +34,9 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
+  # actions: read so the pr-gate cooldown check can list this workflow's past
+  # runs and their jobs through the GitHub API.
+  actions: read
 
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
@@ -42,11 +45,12 @@ env:
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
-    # PPU runner consumption is gated behind the `run-ci` label on the
-    # pull_request event. A called workflow inherits the caller's event,
-    # so the default-enabled gate also applies on the ci.yaml -> workflow_call
-    # path. Manual runs (workflow_dispatch) bypass the gate via the event check.
-    if: github.event_name != 'pull_request' || !inputs.require_run_ci_label || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    # No event/label `if` here: this job is cheap and its outputs drive the
+    # real gate. The run-ci label check lives in the pr-gate job below, which
+    # re-fetches labels live -- a workflow-level `if` reads the event payload
+    # frozen at trigger time, so a label added before a rerun would never
+    # un-skip (the same reason the CUDA line gates at runtime). Manual runs
+    # (workflow_dispatch) are unaffected: pr-gate's checks are PR-event-only.
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
@@ -81,6 +85,23 @@ jobs:
               - "test/registered/**"
               - "scripts/ci/ppu/**"
 
+  # ==================== PR Gate ==================== #
+  # The same reusable gate the CUDA/XPU lines call (`pr-gate.yml`): blocks
+  # draft PRs, requires the run-ci label, and enforces a 120-minute cooldown
+  # for actors without write/maintain/admin on the repo. Only asked to run
+  # when there is PPU work to do -- a no-change PR must not burn a cooldown
+  # slot either. The cooldown counts this workflow's own past runs via
+  # `rate-limit-workflow-id`, not the CUDA line's.
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: ${{ inputs.require_run_ci_label }}
+      cool-down-minutes: 120
+      rate-limit-workflow-id: pr-test-ppu.yml
+    secrets: inherit
+
   # ==================== Stage A: smoke gate (< 5 min test budget) ==================== #
   # Covers the two independent boot failure surfaces measured on ppu1
   # (ci-mechanism-gap-review §10.3): test_ppu_basic.py proves the offline
@@ -96,8 +117,10 @@ jobs:
   # source and cached on /mnt/wl_nas by scripts/ci/ppu/ppu_build_kernel.sh
   # (invoked from ppu_install_dependency.sh) -- no prebuilt wheel artifact.
   stage-a-test-1-gpu-ppu:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    needs: [check-changes, pr-gate]
+    # Gate red (draft PR / missing run-ci / cooldown) skips everything below;
+    # dispatch runs see a green pr-gate because its checks are PR-event-only.
+    if: needs.check-changes.outputs.changes_exist == 'true' && needs.pr-gate.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -172,12 +195,15 @@ jobs:
     needs: [check-changes, stage-a-test-1-gpu-ppu]
     # `always()` overrides skip-on-skipped-dependency so this job still
     # evaluates when stage-a was skipped; !failure() fast-fails when stage-a
-    # went red. That fast-fail is the point of the serial chain.
+    # went red. That fast-fail is the point of the serial chain. The explicit
+    # stage-a result check also holds this stage back when stage-a was
+    # skipped by a red pr-gate rather than by a red test.
     if: |
       always() &&
       !failure() &&
       !cancelled() &&
-      needs.check-changes.outputs.changes_exist == 'true'
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      needs.stage-a-test-1-gpu-ppu.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -238,7 +264,8 @@ jobs:
       always() &&
       !failure() &&
       !cancelled() &&
-      needs.check-changes.outputs.changes_exist == 'true'
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      needs.stage-b-test-1-gpu-ppu.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -294,9 +321,13 @@ jobs:
 
   # ==================== Finish ==================== #
   pr-test-ppu-finish:
+    # pr-gate is in needs so a red gate (draft PR / missing run-ci /
+    # cooldown) fails this finish too, not just skips the stages -- the
+    # result loop below accepts only success/skipped.
     needs:
       [
         check-changes,
+        pr-gate,
         stage-a-test-1-gpu-ppu,
         stage-b-test-1-gpu-ppu,
         stage-c-test-2-gpu-ppu,
