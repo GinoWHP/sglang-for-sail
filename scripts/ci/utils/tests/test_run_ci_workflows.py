@@ -29,7 +29,10 @@ class RunCiWorkflowContractTest(unittest.TestCase):
             "types: [opened, synchronize, reopened, ready_for_review, labeled]",
             workflow,
         )
-        self.assertIn("needs: registration-validation", workflow)
+        jobs = yaml.safe_load(workflow)["jobs"]
+        self.assertEqual(
+            jobs["ci"]["needs"], ["registration-validation", "cpu-precheck"]
+        )
         self.assertIn(
             "contains(github.event.pull_request.labels.*.name, 'run-ci')",
             workflow,
@@ -43,6 +46,97 @@ class RunCiWorkflowContractTest(unittest.TestCase):
         self.assertIn("github.event.action == 'labeled'", workflow)
         self.assertIn("github.event.label.name != 'run-ci'", workflow)
 
+    def test_cpu_precheck_runs_before_label_authorization(self):
+        jobs = yaml.safe_load(self.read_workflow("ci.yaml"))["jobs"]
+        cpu = jobs["cpu-precheck"]
+        self.assertEqual(cpu["needs"], "precheck")
+        self.assertEqual(cpu["uses"], "./.github/workflows/pr-test-ppu.yml")
+        self.assertEqual(cpu["with"], {"cpu_only": True})
+        self.assertNotIn("secrets", cpu)
+        self.assertEqual(
+            cpu["if"].strip(),
+            "github.event_name == 'pull_request' && "
+            "(github.event.action != 'labeled' || github.event.label.name == 'run-ci')",
+        )
+        self.assertEqual(
+            jobs["ci"]["with"],
+            {
+                "cpu_precheck_result": "${{ needs.cpu-precheck.result }}",
+                "cpu_precheck_evidence_ok": "${{ needs.cpu-precheck.outputs.cpu_evidence_ok }}",
+            },
+        )
+
+    def test_cpu_job_is_path_selected_without_authorization(self):
+        workflow = yaml.safe_load(self.read_workflow("pr-test-ppu.yml"))
+        cpu = workflow["jobs"]["stage-a-test-cpu-ppu"]
+        self.assertEqual(cpu["needs"], "check-changes")
+        self.assertEqual(cpu["if"], "needs.check-changes.outputs.cpu == 'true'")
+        self.assertEqual(cpu["runs-on"], "ubuntu-latest")
+        self.assertNotIn("secrets.", json.dumps(cpu))
+        steps = cpu["steps"]
+        for step in steps:
+            if step.get("uses") in (
+                "actions/setup-python@v5",
+                "actions/upload-artifact@v4",
+            ) or step.get("id") in ("worker", "evidence"):
+                self.assertIn("inputs.cpu_precheck_result == ''", step["if"])
+        self.assertIn("steps.reuse.outputs.evidence_ok", cpu["outputs"]["evidence_ok"])
+        self.assertIn(
+            "steps.evidence.outputs.evidence_ok", cpu["outputs"]["evidence_ok"]
+        )
+        reuse = next(step for step in steps if step.get("id") == "reuse")
+        self.assertEqual(reuse["if"], "inputs.cpu_precheck_result != ''")
+        self.assertEqual(
+            reuse["env"],
+            {
+                "CPU_RESULT": "${{ inputs.cpu_precheck_result }}",
+                "CPU_EVIDENCE_OK": "${{ inputs.cpu_precheck_evidence_ok }}",
+            },
+        )
+        for result, evidence in (
+            ("success", "true"),
+            ("failure", "true"),
+            ("cancelled", "true"),
+            ("skipped", "true"),
+            ("", "true"),
+            ("success", "false"),
+            ("success", ""),
+        ):
+            with self.subTest(
+                result=result, evidence=evidence
+            ), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "output"
+                completed = subprocess.run(
+                    ["bash", "-e", "-c", reuse["run"]],
+                    env={
+                        **os.environ,
+                        "GITHUB_OUTPUT": str(output),
+                        "CPU_RESULT": result,
+                        "CPU_EVIDENCE_OK": evidence,
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                valid = result == "success" and evidence == "true"
+                self.assertEqual(completed.returncode == 0, valid)
+                if valid:
+                    self.assertIn("evidence_ok=true", output.read_text())
+                else:
+                    self.assertFalse(output.exists())
+        events = yaml.load(
+            self.read_workflow("pr-test-ppu.yml"), Loader=yaml.BaseLoader
+        )["on"]
+        inputs = events["workflow_call"]["inputs"]
+        self.assertEqual(inputs["cpu_only"]["default"], "false")
+        self.assertEqual(inputs["cpu_precheck_result"]["default"], "")
+        self.assertNotIn("cpu_only", events["workflow_dispatch"]["inputs"])
+        self.assertEqual(
+            events["workflow_call"]["outputs"]["cpu_evidence_ok"]["value"],
+            "${{ jobs.stage-a-test-cpu-ppu.outputs.evidence_ok }}",
+        )
+        self.assertIn("inputs.cpu_only", workflow["concurrency"]["group"])
+
     def test_ppu_workflow_retains_defense_in_depth_label_gate(self):
         workflow = yaml.safe_load(self.read_workflow("pr-test-ppu.yml"))
         gate = workflow["jobs"]["pr-gate"]
@@ -51,7 +145,8 @@ class RunCiWorkflowContractTest(unittest.TestCase):
             gate["with"]["require-run-ci"], "${{ inputs.require_run_ci_label }}"
         )
         self.assertEqual(
-            gate["if"], "needs.check-changes.outputs.changes_exist == 'true'"
+            gate["if"],
+            "inputs.cpu_only != true && needs.check-changes.outputs.changes_exist == 'true'",
         )
         stage = workflow["jobs"]["stage-a-test-1-gpu-ppu"]
         self.assertIn("pr-gate", stage["needs"])
@@ -439,7 +534,7 @@ class PpuPathSelectionTest(unittest.TestCase):
                     timeout=30,
                 )
                 expected = (
-                    "Selected lanes remain subject to PR authorization"
+                    "CPU shortlist runs before run-ci authorization"
                     if force == "true"
                     else "skip the PR gate and all PPU stages"
                 )

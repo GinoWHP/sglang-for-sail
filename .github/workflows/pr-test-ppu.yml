@@ -32,9 +32,28 @@ on:
         required: false
         type: boolean
         default: true
+      cpu_only:
+        description: 'Run path-selected CPU validation without the PR authorization gate or hardware jobs.'
+        required: false
+        type: boolean
+        default: false
+      cpu_precheck_result:
+        description: 'Completed CPU-only workflow result from the same caller run; empty runs CPU locally.'
+        required: false
+        type: string
+        default: ''
+      cpu_precheck_evidence_ok:
+        description: 'Verified CPU evidence output from that CPU-only workflow.'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      cpu_evidence_ok:
+        description: 'True only after the selected CPU shortlist and evidence validation succeed.'
+        value: ${{ jobs.stage-a-test-cpu-ppu.outputs.evidence_ok }}
 
 concurrency:
-  group: pr-test-ppu-${{ inputs.ref || github.ref }}
+  group: pr-test-ppu-${{ inputs.cpu_only && 'cpu' || 'full' }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 permissions:
@@ -156,7 +175,7 @@ jobs:
             echo "| Kernel probes in body pod | $KERNEL |"
             echo "| Two PPU smoke | $MULTI |"
             if [[ "$CPU" == true ]]; then
-              echo 'Selected lanes remain subject to PR authorization and prerequisite success.'
+              echo 'CPU shortlist runs before run-ci authorization; selected hardware lanes still require PR authorization and prerequisite success.'
             else
               echo 'No PPU-relevant executable/configuration changes: skip the PR gate and all PPU stages.'
             fi
@@ -169,28 +188,42 @@ jobs:
   # Only invoke the gate when there is PPU work to do.
   pr-gate:
     needs: check-changes
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    if: inputs.cpu_only != true && needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: ${{ inputs.require_run_ci_label }}
       cool-down-minutes: 0
     secrets: inherit
 
-  # CPU and smoke are independent base-a prerequisites, as in ordinary CUDA PRs.
+  # CPU needs only path selection. Full CI reuses the caller's verified result;
+  # standalone/manual runs execute the same shortlist and evidence checks here.
   stage-a-test-cpu-ppu:
-    needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.cpu == 'true' && needs.pr-gate.result == 'success'
+    needs: check-changes
+    if: needs.check-changes.outputs.cpu == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok || steps.reuse.outputs.evidence_ok }}
     env:
       PPU_EVIDENCE_DIR: /tmp/ppu-pr/${{ github.run_id }}/${{ github.run_attempt }}/stage-a-test-cpu-ppu
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+      - name: Reuse verified CPU precheck
+        id: reuse
+        if: inputs.cpu_precheck_result != ''
+        env:
+          CPU_RESULT: ${{ inputs.cpu_precheck_result }}
+          CPU_EVIDENCE_OK: ${{ inputs.cpu_precheck_evidence_ok }}
+        run: |
+          if [[ "$CPU_RESULT" != success || "$CPU_EVIDENCE_OK" != true ]]; then
+            echo 'CPU precheck did not succeed with verified evidence.' >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
+        if: inputs.cpu_precheck_result == ''
         with:
           python-version: '3.12'
           cache: pip
@@ -199,10 +232,11 @@ jobs:
             scripts/ci/ppu/install_pr_cpu.sh
       - name: Run CPU shortlist
         id: worker
+        if: inputs.cpu_precheck_result == ''
         run: bash scripts/ci/ppu/run_pr_suite.sh cpu
       - name: Validate CPU evidence
         id: evidence
-        if: always()
+        if: always() && inputs.cpu_precheck_result == ''
         env:
           WORKER_OUTCOME: ${{ steps.worker.outcome }}
         run: |
@@ -212,7 +246,7 @@ jobs:
           [[ "$WORKER_OUTCOME" == success ]]
           echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && inputs.cpu_precheck_result == ''
         with:
           name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
           path: ${{ env.PPU_EVIDENCE_DIR }}
@@ -353,4 +387,8 @@ jobs:
       - name: Require selected jobs and evidence
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
-        run: python3 scripts/ci/ppu/pr_report.py aggregate
+          CPU_ONLY: ${{ inputs.cpu_only }}
+        run: |
+          args=()
+          [[ "$CPU_ONLY" != true ]] || args+=(--cpu-only)
+          python3 scripts/ci/ppu/pr_report.py aggregate "${args[@]}"

@@ -57,6 +57,18 @@ jobs:
           NODE_PATH: ${{ runner.temp }}/ppu-ci-filter-tests/node_modules
         run: python3 -m unittest discover -s scripts/ci/utils/tests -p 'test_run_ci_*.py' -v
 
+  # CPU validation runs without run-ci or private worker credentials. Reuse the
+  # same path selector as hardware CI so documentation-only PRs skip the suite.
+  cpu-precheck:
+    name: CPU Shortlist
+    needs: precheck
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
+    uses: ./.github/workflows/pr-test-ppu.yml
+    with:
+      cpu_only: true
+
   ai-code-review:
     name: AI Code Review (Copilot Gate)
     needs: precheck
@@ -75,12 +87,17 @@ jobs:
   # is an independent merge gate and does not delay PPU feedback.
   # For labeled events, only adding run-ci starts Full CI; adding another label
   # to a PR that already has run-ci must not create a duplicate run.
+  # The selected CPU suite must also pass, including evidence validation. Only
+  # reuse its result from this workflow run; do not trust a previous PR revision.
   ci:
     name: Full CI
-    needs: registration-validation
+    needs: [registration-validation, cpu-precheck]
     if: >-
       github.event_name == 'pull_request' &&
       contains(github.event.pull_request.labels.*.name, 'run-ci') &&
       (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
     uses: ./.github/workflows/pr-test-ppu.yml
+    with:
+      cpu_precheck_result: ${{ needs.cpu-precheck.result }}
+      cpu_precheck_evidence_ok: ${{ needs.cpu-precheck.outputs.cpu_evidence_ok }}
     secrets: inherit

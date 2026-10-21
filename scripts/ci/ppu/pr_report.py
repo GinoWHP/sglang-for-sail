@@ -196,7 +196,7 @@ def summarize(directory, lane):
     return result
 
 
-def aggregate(needs):
+def aggregate(needs, cpu_only=False):
     check = needs.get("check-changes", {})
     if check.get("result") != "success":
         return False
@@ -210,7 +210,8 @@ def aggregate(needs):
         selection[lane] == "true"
         for lane in ("cpu", "ppu_single", "ppu_kernel", "ppu_multi")
     )
-    if needs.get("pr-gate", {}).get("result") != ("success" if selected else "skipped"):
+    gate_result = "success" if selected and not cpu_only else "skipped"
+    if needs.get("pr-gate", {}).get("result") != gate_result:
         return False
     if selection["ppu_single"] == "true" and selection["cpu"] != "true":
         return False
@@ -220,7 +221,7 @@ def aggregate(needs):
         return False
     for job, lane in JOBS.items():
         record = needs.get(job, {})
-        if selection[lane] == "true":
+        if selection[lane] == "true" and (not cpu_only or lane == "cpu"):
             if (
                 record.get("result") != "success"
                 or record.get("outputs", {}).get("evidence_ok") != "true"
@@ -239,9 +240,12 @@ if __name__ == "__main__":
     parser.add_argument("--directory")
     parser.add_argument("--lane", choices=SUITES)
     parser.add_argument("--kernel", action="store_true")
+    parser.add_argument("--cpu-only", action="store_true")
     args = parser.parse_args()
     if args.mode == "aggregate":
-        raise SystemExit(0 if aggregate(json.loads(os.environ["NEEDS_JSON"])) else 1)
+        raise SystemExit(
+            0 if aggregate(json.loads(os.environ["NEEDS_JSON"]), args.cpu_only) else 1
+        )
     elif args.mode == "verify":
         verify(args.directory, args.lane, args.kernel)
     elif args.mode == "summarize":

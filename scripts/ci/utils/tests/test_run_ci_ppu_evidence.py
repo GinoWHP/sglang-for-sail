@@ -257,6 +257,66 @@ class FinalStatusTest(unittest.TestCase):
                     changed[job]["result"] = status
                     self.assertFalse(REPORT.aggregate(changed), (lanes, job, status))
 
+    def test_cpu_only_requires_evidence_and_skips_hardware_and_gate(self):
+        for lanes in (set(), {"cpu"}, {"cpu", "ppu_single", "ppu_kernel", "ppu_multi"}):
+            needs = self.needs(lanes)
+            needs["pr-gate"]["result"] = "skipped"
+            for job, lane in REPORT.JOBS.items():
+                if lane != "cpu":
+                    needs[job]["result"] = "skipped"
+            self.assertTrue(REPORT.aggregate(needs, cpu_only=True))
+            if lanes:
+                self.assertFalse(REPORT.aggregate(needs))
+            for job in needs:
+                for status in ("success", "failure", "cancelled", "skipped"):
+                    if needs[job]["result"] == status:
+                        continue
+                    changed = copy.deepcopy(needs)
+                    changed[job]["result"] = status
+                    self.assertFalse(
+                        REPORT.aggregate(changed, cpu_only=True), (lanes, job, status)
+                    )
+            if lanes:
+                for evidence in ("false", "", None):
+                    changed = copy.deepcopy(needs)
+                    changed["stage-a-test-cpu-ppu"]["outputs"]["evidence_ok"] = evidence
+                    self.assertFalse(REPORT.aggregate(changed, cpu_only=True))
+            for lane in needs["check-changes"]["outputs"]:
+                changed = copy.deepcopy(needs)
+                changed["check-changes"]["outputs"].pop(lane)
+                self.assertFalse(REPORT.aggregate(changed, cpu_only=True))
+        self.assertFalse(REPORT.aggregate(self.needs({"ppu_multi"}), cpu_only=True))
+
+    def test_cpu_only_finish_uses_strict_aggregate_cli(self):
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/pr-test-ppu.yml").read_text()
+        )
+        finish = workflow["jobs"]["pr-test-ppu-finish"]["steps"][-1]
+        self.assertEqual(finish["env"]["CPU_ONLY"], "${{ inputs.cpu_only }}")
+        self.assertEqual(finish["env"]["NEEDS_JSON"], "${{ toJson(needs) }}")
+        for lanes in (set(), {"cpu"}):
+            needs = self.needs(lanes)
+            needs["pr-gate"]["result"] = "skipped"
+            for cpu_only in ("true", "false", ""):
+                with self.subTest(lanes=lanes, cpu_only=cpu_only):
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", finish["run"]],
+                        cwd=ROOT,
+                        env={
+                            **os.environ,
+                            "NEEDS_JSON": json.dumps(needs),
+                            "CPU_ONLY": cpu_only,
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0 if not lanes or cpu_only == "true" else 1,
+                        result.stderr,
+                    )
+
     def test_missing_evidence_or_selection_is_red(self):
         needs = self.needs({"cpu", "ppu_single"})
         for job in (
