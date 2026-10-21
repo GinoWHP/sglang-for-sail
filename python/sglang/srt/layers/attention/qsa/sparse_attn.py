@@ -1,5 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+import os
 from typing import Optional
 
 import torch
@@ -21,8 +22,31 @@ _L20_CONFIGS = [
 ]
 
 
+_PPU_CONFIGS = [  # ZW-M890P: rows <=512 unchanged from L20; >512 retuned on PPU (D-K3)
+    (32, (32, 8, 2)),
+    (64, (64, 8, 2)),
+    (128, (64, 4, 2)),
+    (512, (32, 4, 2)),
+    (float("inf"), (32, 2, 2)),
+]
+
+
+def _ppu_cfg_disabled() -> bool:
+    return os.environ.get("SGLANG_QSA_PPU_CFG", "1")[0] == "0"
+
+
+def _is_ppu(device_name: str) -> bool:
+    return "ZW-M890P" in device_name
+
+
 def _get_best_config(total_q: int):
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    name = torch.cuda.get_device_name(0)
+    if "H20" in name:
+        table = _H20_CONFIGS
+    elif _is_ppu(name) and not _ppu_cfg_disabled():
+        table = _PPU_CONFIGS
+    else:
+        table = _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
