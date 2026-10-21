@@ -61,6 +61,11 @@ permissions:
   pull-requests: read
   actions: read
 
+# Container jobs otherwise default to sh; evidence validation uses Bash arrays.
+defaults:
+  run:
+    shell: bash
+
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
   PPU_SDK_VERSION: 2.2.0
@@ -252,6 +257,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Container-hook runners cannot load checkout-local step actions. Like vLLM,
+  # invoke the published worker action directly and run repository scripts in the
+  # job container. Pin all three lanes to the same reviewed action revision.
+  # Shared NAS remains writable by explicit policy; PR cache/evidence paths are
+  # separate destinations, not a filesystem access-control boundary.
   stage-a-test-1-gpu-ppu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.ppu_single == 'true' && needs.pr-gate.result == 'success'
@@ -260,7 +270,7 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 12
     outputs:
-      evidence_ok: ${{ steps.suite.outputs.evidence_ok }}
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
       - name: Checkout code
         id: checkout
@@ -278,15 +288,75 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
-      - uses: ./.github/actions/ppu-pr-suite
-        id: suite
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve immutable image
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Prepare worker evidence
         env:
+          PPU_ENV_HASHED_NAME: 'true'
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_RUNNER_NAME: ${{ runner.name }}
+          MATRIX_JSON: ${{ toJSON(matrix) }}
+          PPU_ENV_NAMESPACE: ppu-sched
+          PPU_ENV_PR_TIMINGS: 'true'
+          PPU_ENV_OBSERVER_LIMIT: '540'
+        run: |
+          if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
+            echo 'Missing immutable worker image identity.' >&2
+            exit 1
+          fi
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          mkdir -p "$directory"
+          bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
+      - name: Execute PPU smoke worker
+        id: worker
+        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=OAM-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh smoke
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/smoke:/ppu-pr-cache
+          extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=false,PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          container_options: |
+            host_ipc: true
+            shm_size: 8Gi
+          timeout_minutes: 9
+          cleanup_policy: always
+      - name: Validate evidence
+        id: evidence
+        if: always()
+        env:
+          LANE: smoke
+          KERNEL: 'false'
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          python3 scripts/ci/ppu/pr_report.py sanitize --directory "$directory"
+          python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
+          args=()
+          [[ "$KERNEL" != true ]] || args+=(--kernel)
+          python3 scripts/ci/ppu/pr_report.py verify --directory "$directory" --lane "$LANE" "${args[@]}"
+          if [[ "$WORKER_OUTCOME" != success ]]; then
+            echo "Worker did not succeed: $WORKER_OUTCOME" >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          lane: smoke
-          cards: 1
-          worker-minutes: 9
+          name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
 
   # Both base-b bodies wait for selected CPU/smoke success, not for each other.
   stage-b-test-1-gpu-ppu:
@@ -302,7 +372,7 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 25
     outputs:
-      evidence_ok: ${{ steps.suite.outputs.evidence_ok }}
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
       - name: Checkout code
         id: checkout
@@ -320,16 +390,75 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
-      - uses: ./.github/actions/ppu-pr-suite
-        id: suite
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve immutable image
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Prepare worker evidence
         env:
+          PPU_ENV_HASHED_NAME: 'true'
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_RUNNER_NAME: ${{ runner.name }}
+          MATRIX_JSON: ${{ toJSON(matrix) }}
+          PPU_ENV_NAMESPACE: ppu-sched
+          PPU_ENV_PR_TIMINGS: 'true'
+          PPU_ENV_OBSERVER_LIMIT: '1320'
+        run: |
+          if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
+            echo 'Missing immutable worker image identity.' >&2
+            exit 1
+          fi
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          mkdir -p "$directory"
+          bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
+      - name: Execute PPU body worker
+        id: worker
+        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=OAM-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh body
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/body:/ppu-pr-cache
+          extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=${{ needs.check-changes.outputs.ppu_kernel }},PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          container_options: |
+            host_ipc: true
+            shm_size: 8Gi
+          timeout_minutes: 22
+          cleanup_policy: always
+      - name: Validate evidence
+        id: evidence
+        if: always()
+        env:
+          LANE: body
+          KERNEL: ${{ needs.check-changes.outputs.ppu_kernel }}
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          python3 scripts/ci/ppu/pr_report.py sanitize --directory "$directory"
+          python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
+          args=()
+          [[ "$KERNEL" != true ]] || args+=(--kernel)
+          python3 scripts/ci/ppu/pr_report.py verify --directory "$directory" --lane "$LANE" "${args[@]}"
+          if [[ "$WORKER_OUTCOME" != success ]]; then
+            echo "Worker did not succeed: $WORKER_OUTCOME" >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          lane: body
-          cards: 1
-          worker-minutes: 22
-          kernel: ${{ needs.check-changes.outputs.ppu_kernel }}
+          name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
 
   stage-c-test-2-gpu-ppu:
     # Legacy stage-c ID is retained for compatibility; this is a parallel body.
@@ -346,7 +475,7 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 20
     outputs:
-      evidence_ok: ${{ steps.suite.outputs.evidence_ok }}
+      evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
       - name: Checkout code
         id: checkout
@@ -364,15 +493,75 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
-      - uses: ./.github/actions/ppu-pr-suite
-        id: suite
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve immutable image
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Prepare worker evidence
         env:
+          PPU_ENV_HASHED_NAME: 'true'
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_RUNNER_NAME: ${{ runner.name }}
+          MATRIX_JSON: ${{ toJSON(matrix) }}
+          PPU_ENV_NAMESPACE: ppu-sched
+          PPU_ENV_PR_TIMINGS: 'true'
+          PPU_ENV_OBSERVER_LIMIT: '1020'
+        run: |
+          if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
+            echo 'Missing immutable worker image identity.' >&2
+            exit 1
+          fi
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          mkdir -p "$directory"
+          bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
+      - name: Execute two-PPU worker
+        id: worker
+        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
+          nnodes: 0
+          nproc_per_node: 2
+          node_selector: board-type=OAM-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh multi
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/multi:/ppu-pr-cache
+          extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=false,PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          container_options: |
+            host_ipc: true
+            shm_size: 8Gi
+          timeout_minutes: 17
+          cleanup_policy: always
+      - name: Validate evidence
+        id: evidence
+        if: always()
+        env:
+          LANE: multi
+          KERNEL: 'false'
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+          python3 scripts/ci/ppu/pr_report.py sanitize --directory "$directory"
+          python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
+          args=()
+          [[ "$KERNEL" != true ]] || args+=(--kernel)
+          python3 scripts/ci/ppu/pr_report.py verify --directory "$directory" --lane "$LANE" "${args[@]}"
+          if [[ "$WORKER_OUTCOME" != success ]]; then
+            echo "Worker did not succeed: $WORKER_OUTCOME" >&2
+            exit 1
+          fi
+          echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          lane: multi
-          cards: 2
-          worker-minutes: 17
+          name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
 
   pr-test-ppu-finish:
     needs:

@@ -573,10 +573,15 @@ class PpuPathSelectionTest(unittest.TestCase):
             self.assertIn(job, jobs["pr-test-ppu-finish"]["needs"])
         for job in (smoke, body, multi):
             self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-flytiger")
-            action = next(s for s in jobs[job]["steps"] if s.get("id") == "suite")
-            self.assertEqual(action["uses"], "./.github/actions/ppu-pr-suite")
+            action = next(s for s in jobs[job]["steps"] if s.get("id") == "worker")
+            self.assertRegex(
+                action["uses"], r"^flytiger-eco/ppu-distributed-action@[a-f0-9]{40}$"
+            )
+            self.assertEqual(
+                action["with"]["timeout_minutes"], {smoke: 9, body: 22, multi: 17}[job]
+            )
             self.assertLess(
-                action["with"]["worker-minutes"], jobs[job]["timeout-minutes"]
+                action["with"]["timeout_minutes"], jobs[job]["timeout-minutes"]
             )
         self.assertEqual(jobs[cpu]["runs-on"], "ubuntu-latest")
 

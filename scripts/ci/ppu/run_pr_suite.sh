@@ -29,9 +29,9 @@ esac
 if [[ "$lane" == cpu ]]; then
     bash scripts/ci/ppu/install_pr_cpu.sh > "$PPU_EVIDENCE_DIR/setup.log" 2>&1
 else
-    # Default NAS mounts are read-only in the PR-local worker action. Only
-    # /ppu-pr-cache and /ppu-evidence are writable host mounts. These variables
-    # choose destinations but are NOT the access-control boundary.
+    # Match vLLM's published-action policy: shared NAS mounts remain writable.
+    # Keep routine writes in /ppu-pr-cache and /ppu-evidence, but these paths
+    # are destinations, not a filesystem access-control boundary.
     export PPU_INSTALL_PROFILE=pr
     export GITHUB_WORKSPACE="$ROOT"
     export PIP_CACHE_DIR=/ppu-pr-cache/pip

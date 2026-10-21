@@ -37,7 +37,18 @@ sanitize_name() {
 owner=$(sanitize_name "${GITHUB_REPOSITORY_OWNER:-unknown}" | cut -c1-20 | sed 's/-*$//')
 suffix=$(sanitize_name "${PPU_ENV_JOB:-unknown}" | cut -c1-20 | sed 's/-*$//')
 job=$(printf 'ppu-%s-%s-%s-%s' "$owner" "${GITHUB_RUN_ID:-0}" "${GITHUB_RUN_ATTEMPT:-1}" "$suffix" | cut -c1-52 | sed 's/-*$//')
-# PR-local action passes its resolved name, including the upstream uniqueness hash.
+# PR remote calls use job_suffix=github.job. Match job-name.sh at the pinned
+# 06c8ee7cadaae2086db4977e571b19f461653f16 revision before the action submits pods.
+# Leave legacy nightly naming unchanged unless this mode is explicitly enabled.
+if [ "${PPU_ENV_HASHED_NAME:-false}" = true ]; then
+  matrix="${MATRIX_JSON:-}"
+  [ "$matrix" != null ] || matrix=""
+  hash=$(printf '%s\n%s\n%s\n%s' "${PPU_RUNNER_NAME:-}" "${PPU_ENV_JOB:-}" "${PPU_ENV_JOB:-}" "$matrix" | md5sum | cut -c1-6)
+  readable=$(sanitize_name "${PPU_ENV_JOB:-}")
+  prefix=$(printf 'ppu-%s-%s-%s-%s' "$owner" "${GITHUB_RUN_ID:-0}" "${GITHUB_RUN_ATTEMPT:-1}" "$readable" | cut -c1-45 | sed 's/-*$//')
+  job="${prefix}-${hash}"
+fi
+# Explicit names remain supported for callers that already resolved the name.
 job="${PPU_ENV_JOB_NAME:-$job}"
 # 字段均来自 API 身份/状态；不能改为完整 -o json，以免归档 Secret 环境变量。
 query='{range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.spec.nodeName}{"\t"}{.spec.containers[?(@.name=="worker")].image}{"\t"}{.status.containerStatuses[?(@.name=="worker")].imageID}{"\n"}{end}'

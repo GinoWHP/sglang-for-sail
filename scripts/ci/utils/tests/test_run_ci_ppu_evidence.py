@@ -2,6 +2,7 @@
 
 import ast
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -28,7 +29,7 @@ def load(name, relative):
 
 RUNNER = load("ppu_runner", "python/sglang/test/ci/pr_runner.py")
 REPORT = load("ppu_report", "scripts/ci/ppu/pr_report.py")
-MOUNTS = load("ppu_mounts", "scripts/ci/ppu/prepare_pr_action.py")
+ACTION_REVISION = "06c8ee7cadaae2086db4977e571b19f461653f16"
 MODEL = load("ppu_model", "python/sglang/test/ppu_pr_utils.py")
 
 
@@ -419,33 +420,77 @@ class CpuShortlistContractTest(unittest.TestCase):
 
 
 class SetupContractTest(unittest.TestCase):
-    def test_read_only_mount_patch_rendering_and_drift(self):
-        entries = (
-            "nas-aisw|/nas_aisw|/nas_aisw",
-            "wl-nas|/mnt/wl_nas|/wl_nas",
-            "wl-nas-direct|/wl_nas|/wl_nas",
+    def hardware_jobs(self):
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/pr-test-ppu.yml").read_text()
         )
-        source = (
-            "DEFAULT_NAS_VOLUME_MOUNTS=''\nDEFAULT_NAS_VOLUMES=("
-            + " ".join(repr(e) for e in entries)
-            + ")\n"
-        )
-        source += 'for _def_entry in "${DEFAULT_NAS_VOLUMES[@]}"; do\n  IFS=\'|\' read -r _vname _mpath _hpath <<< "$_def_entry"\n  DEFAULT_NAS_VOLUME_MOUNTS+="        - name: ${_vname}"$\'\\n\'\n'
-        source += (
-            MOUNTS.MOUNT_LINE + '\ndone\nprintf "%s" "$DEFAULT_NAS_VOLUME_MOUNTS"\n'
-        )
-        rendered = subprocess.check_output(
-            ["bash", "-c", MOUNTS.constrain(source)], text=True
-        )
-        mounts = yaml.safe_load(rendered)
-        self.assertEqual(len(mounts), 3)
-        self.assertTrue(all(m["readOnly"] is True for m in mounts))
-        with self.assertRaises(ValueError):
-            MOUNTS.constrain(source.replace(MOUNTS.MOUNT_LINE, ""))
+        self.assertEqual(workflow["defaults"]["run"]["shell"], "bash")
+        return {
+            name: workflow["jobs"][name]
+            for name in REPORT.JOBS
+            if name != "stage-a-test-cpu-ppu"
+        }
 
-    def test_observer_is_inserted_at_resolved_submit_step(self):
-        source = "runs:\n  steps:\n    - shell: bash\n" + MOUNTS.SUBMIT_LINE + "\n"
-        # Optionally validate the exact pinned checkout without submitting pods.
+    def test_hardware_jobs_never_load_checkout_local_actions(self):
+        self.assertFalse((ROOT / ".github/actions/ppu-pr-suite/action.yml").exists())
+        self.assertFalse((ROOT / "scripts/ci/ppu/prepare_pr_action.py").exists())
+        for name, job in self.hardware_jobs().items():
+            with self.subTest(job=name):
+                for step in job["steps"]:
+                    self.assertFalse(step.get("uses", "").startswith("./"))
+                    self.assertNotIn(".ppu-pr-action", json.dumps(step))
+                    self.assertNotIn("prepare_pr_action.py", json.dumps(step))
+                    if "run" in step:
+                        subprocess.run(
+                            ["bash", "-n"], input=step["run"], text=True, check=True
+                        )
+                prepare = next(
+                    s
+                    for s in job["steps"]
+                    if s.get("name") == "Prepare worker evidence"
+                )
+                worker = next(s for s in job["steps"] if s.get("id") == "worker")
+                self.assertLess(job["steps"].index(prepare), job["steps"].index(worker))
+                env = prepare["env"]
+                self.assertEqual(env["PPU_ENV_HASHED_NAME"], "true")
+                self.assertEqual(env["PPU_ENV_JOB"], worker["with"]["job_suffix"])
+                self.assertEqual(env["PPU_RUNNER_NAME"], "${{ runner.name }}")
+                self.assertEqual(env["MATRIX_JSON"], "${{ toJSON(matrix) }}")
+                self.assertEqual(env["PPU_ENV_NAMESPACE"], worker["with"]["namespace"])
+                self.assertEqual(env["PPU_ENV_PR_TIMINGS"], "true")
+                self.assertEqual(
+                    int(env["PPU_ENV_OBSERVER_LIMIT"]),
+                    worker["with"]["timeout_minutes"] * 60,
+                )
+                self.assertIn("observe_pod_environment.sh start", prepare["run"])
+                for digest, image in (
+                    ("", "image:tag"),
+                    ("sha256:bad", "image@sha256:bad"),
+                    ("sha256:" + "a" * 64, "image:tag"),
+                ):
+                    # Invalid image identity must fail before any NAS writes.
+                    result = subprocess.run(
+                        [
+                            "bash",
+                            "--noprofile",
+                            "--norc",
+                            "-eo",
+                            "pipefail",
+                            "-c",
+                            prepare["run"],
+                        ],
+                        env={
+                            **os.environ,
+                            "PPU_BASE_IMAGE_DIGEST": digest,
+                            "PPU_BASE_IMAGE_REF": image,
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_observer_matches_pinned_remote_action_naming(self):
         checkout = os.environ.get("PPU_ACTION_CONTRACT_SOURCE")
         if checkout:
             directory = Path(checkout)
@@ -453,43 +498,154 @@ class SetupContractTest(unittest.TestCase):
                 subprocess.check_output(
                     ["git", "-C", str(directory), "rev-parse", "HEAD"], text=True
                 ).strip(),
-                MOUNTS.REVISION,
+                ACTION_REVISION,
             )
-            source = (directory / "action.yml").read_text()
-            constrained = MOUNTS.constrain(
-                (directory / "scripts/submit.sh").read_text()
-            )
-            subprocess.run(["bash", "-n"], input=constrained, text=True, check=True)
-            self.assertIn("${DEFAULT_NAS_VOLUME_MOUNTS}", constrained)
-            start = constrained.index('DEFAULT_NAS_VOLUME_MOUNTS=""')
-            end = constrained.index("# --- 循环创建 N 个 Pod ---", start)
-            entries = 'DEFAULT_NAS_VOLUMES=("nas-aisw|/nas_aisw|/nas_aisw" "wl-nas|/mnt/wl_nas|/wl_nas" "wl-nas-direct|/wl_nas|/wl_nas")\n'
-            rendered = subprocess.check_output(
-                [
-                    "bash",
-                    "-c",
-                    entries
-                    + constrained[start:end]
-                    + '\nprintf "%s" "$DEFAULT_NAS_VOLUME_MOUNTS"',
-                ],
-                text=True,
-            )
-            self.assertTrue(all(m["readOnly"] for m in yaml.safe_load(rendered)))
-        patched = MOUNTS.observe_before_submit(source)
-        action = yaml.safe_load(patched)
-        step = next(
-            s
-            for s in action["runs"]["steps"]
-            if "observe_pod_environment.sh" in s.get("run", "")
-        )
-        self.assertLess(
-            step["run"].index("observe_pod_environment.sh"),
-            step["run"].index("scripts/submit.sh"),
-        )
-        self.assertIn('PPU_ENV_JOB_NAME="$JOB_NAME"', step["run"])
-        subprocess.run(["bash", "-n"], input=step["run"], text=True, check=True)
-        with self.assertRaises(ValueError):
-            MOUNTS.observe_before_submit(patched)
+        names = set()
+        for job in self.hardware_jobs():
+            for runner_name, matrix in (
+                ("runner-a", "null"),
+                ("runner-b", ""),
+                ("runner-b", '{"shard": 1}'),
+            ):
+                with self.subTest(
+                    job=job, runner=runner_name, matrix=matrix
+                ), tempfile.TemporaryDirectory() as temp:
+                    directory = Path(temp)
+                    normalized = "" if matrix == "null" else matrix
+                    digest = hashlib.md5(
+                        f"{runner_name}\n{job}\n{job}\n{normalized}".encode(),
+                        usedforsecurity=False,
+                    ).hexdigest()[:6]
+                    prefix = f"ppu-flytiger-eco-39610521197-2-{job}"[:45].rstrip("-")
+                    expected = f"{prefix}-{digest}"
+                    self.assertNotIn(expected, names)
+                    names.add(expected)
+                    env = {
+                        **os.environ,
+                        "GITHUB_REPOSITORY_OWNER": "flytiger-eco",
+                        "GITHUB_RUN_ID": "39610521197",
+                        "GITHUB_RUN_ATTEMPT": "2",
+                        "GITHUB_JOB_NAME": job,
+                        "INPUT_JOB_SUFFIX": job,
+                        "PPU_RUNNER_NAME": runner_name,
+                        "MATRIX_JSON": matrix,
+                        "PPU_ENV_HASHED_NAME": "true",
+                        "PPU_ENV_JOB": job,
+                        "PPU_ENV_JOB_NAME": "",
+                        "PPU_ENV_NAMESPACE": "ppu-sched",
+                        "PPU_ENV_PR_TIMINGS": "true",
+                        "PPU_ENV_EXPECTED_PODS": "1",
+                        "PPU_ENV_OBSERVER_LIMIT": "2",
+                        "PPU_ENV_OBSERVER_INTERVAL": "0.1",
+                        "PATH": str(directory) + os.pathsep + os.environ["PATH"],
+                    }
+                    if checkout:
+                        actual = subprocess.check_output(
+                            ["bash", str(Path(checkout) / "scripts/job-name.sh")],
+                            env=env,
+                            text=True,
+                        ).strip()
+                        self.assertEqual(actual, expected)
+                    kubectl = directory / "kubectl"
+                    kubectl.write_text(
+                        "#!/bin/sh\n"
+                        f'case "$*" in *"-n ppu-sched -l ppu-job={expected}"*) ;; *) exit 9;; esac\n'
+                        'case "$*" in *creationTimestamp*) printf "2026-01-01T00:00:00Z\\t2026-01-01T00:00:03Z\\t2026-01-01T00:00:11Z\\n";;\n'
+                        f'*) printf "{expected}-worker-0\\tuid0\\tnode0\\timage@sha256:aaa\\tcontainerd://sha256:aaa\\n";; esac\n'
+                    )
+                    kubectl.chmod(0o755)
+                    output = directory / "pods.tsv"
+                    subprocess.run(
+                        [
+                            "bash",
+                            str(ROOT / "scripts/ci/ppu/observe_pod_environment.sh"),
+                            "watch",
+                            str(output),
+                        ],
+                        env=env,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(
+                        output.with_suffix(".status").read_text().strip(), "ok"
+                    )
+                    self.assertIn(expected + "-worker-0", output.read_text())
+                    self.assertEqual(
+                        len(
+                            output.with_suffix(".timing.tsv")
+                            .read_text()
+                            .strip()
+                            .split("\t")
+                        ),
+                        3,
+                    )
+
+    def test_worker_failure_and_evidence_failure_cannot_publish_success(self):
+        for name, job in self.hardware_jobs().items():
+            evidence = next(s for s in job["steps"] if s.get("id") == "evidence")
+            for outcome, verify_rc in (
+                ("success", 0),
+                ("failure", 0),
+                ("cancelled", 0),
+                ("skipped", 0),
+                ("success", 1),
+            ):
+                with self.subTest(
+                    job=name, outcome=outcome, verify_rc=verify_rc
+                ), tempfile.TemporaryDirectory() as temp:
+                    directory = Path(temp)
+                    stub = directory / "python3"
+                    stub.write_text(
+                        f"#!{sys.executable}\nimport os,sys\nfrom pathlib import Path\n"
+                        "with Path(os.environ['CALL_LOG']).open('a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+                        "sys.exit(int(os.environ['VERIFY_RC']) if sys.argv[2] == 'verify' else 0)\n"
+                    )
+                    stub.chmod(0o755)
+                    output = directory / "output"
+                    log = directory / "calls"
+                    env = {
+                        **os.environ,
+                        "PATH": str(directory) + os.pathsep + os.environ["PATH"],
+                        "GITHUB_RUN_ID": "123",
+                        "GITHUB_RUN_ATTEMPT": "2",
+                        "GITHUB_JOB": name,
+                        "LANE": evidence["env"]["LANE"],
+                        "KERNEL": (
+                            "true" if evidence["env"]["LANE"] == "body" else "false"
+                        ),
+                        "WORKER_OUTCOME": outcome,
+                        "VERIFY_RC": str(verify_rc),
+                        "GITHUB_OUTPUT": str(output),
+                        "CALL_LOG": str(log),
+                    }
+                    result = subprocess.run(
+                        [
+                            "bash",
+                            "--noprofile",
+                            "--norc",
+                            "-eo",
+                            "pipefail",
+                            "-c",
+                            evidence["run"],
+                        ],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    valid = outcome == "success" and verify_rc == 0
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
+                    self.assertEqual(output.exists(), valid)
+                    if valid:
+                        self.assertEqual(output.read_text().strip(), "evidence_ok=true")
+                    calls = log.read_text().splitlines()
+                    self.assertEqual(
+                        [line.split()[1] for line in calls],
+                        ["sanitize", "summarize", "verify"],
+                    )
+                    self.assertEqual("--kernel" in calls[-1], env["KERNEL"] == "true")
 
     def test_summary_separates_observed_and_unknown_timings(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -545,19 +701,82 @@ class SetupContractTest(unittest.TestCase):
         self.assertEqual(len(sampler.errors), 1)
         self.assertEqual(len(sampler.completed), 1)
 
-    def test_action_uses_only_pr_writable_mounts(self):
-        action = yaml.safe_load(
-            (ROOT / ".github/actions/ppu-pr-suite/action.yml").read_text()
+    def test_remote_action_keeps_scoped_destinations_and_strict_evidence(self):
+        checkout = os.environ.get("PPU_ACTION_CONTRACT_SOURCE")
+        contract = (
+            yaml.safe_load((Path(checkout) / "action.yml").read_text())
+            if checkout
+            else None
         )
-        worker = next(s for s in action["runs"]["steps"] if s.get("id") == "worker")
-        mounts = worker["with"]["host_volumes"].split(",")
-        self.assertEqual(len(mounts), 2)
-        self.assertTrue(all(m.startswith("/wl_nas/pr-ci/") for m in mounts))
-        self.assertEqual(worker["with"]["node_selector"], "board-type=OAM-810E")
-        checkout = next(
-            s for s in action["runs"]["steps"] if s.get("with", {}).get("repository")
-        )
-        self.assertEqual(checkout["with"]["ref"], MOUNTS.REVISION)
+        for name, job in self.hardware_jobs().items():
+            with self.subTest(job=name):
+                worker = next(s for s in job["steps"] if s.get("id") == "worker")
+                self.assertEqual(
+                    worker["uses"],
+                    f"flytiger-eco/ppu-distributed-action@{ACTION_REVISION}",
+                )
+                self.assertNotIn("continue-on-error", worker)
+                inputs = worker["with"]
+                if contract:
+                    self.assertLessEqual(set(inputs), set(contract["inputs"]))
+                self.assertEqual(inputs["image"], "${{ env.PPU_BASE_IMAGE_REF }}")
+                self.assertEqual(inputs["node_selector"], "board-type=OAM-810E")
+                self.assertEqual(inputs["namespace"], "ppu-sched")
+                self.assertEqual(inputs["cleanup_policy"], "always")
+                self.assertEqual(inputs["job_suffix"], "${{ github.job }}")
+                self.assertEqual(inputs["nnodes"], 0)
+                self.assertEqual(inputs["nproc_per_node"], 2 if "2-gpu" in name else 1)
+                self.assertEqual(
+                    yaml.safe_load(inputs["container_options"]),
+                    {"host_ipc": True, "shm_size": "8Gi"},
+                )
+                mounts = inputs["host_volumes"].split(",")
+                self.assertEqual(len(mounts), 2)
+                self.assertTrue(all(m.startswith("/wl_nas/pr-ci/") for m in mounts))
+                self.assertEqual(
+                    [m.split(":")[1] for m in mounts],
+                    ["/ppu-evidence", "/ppu-pr-cache"],
+                )
+                evidence = next(s for s in job["steps"] if s.get("id") == "evidence")
+                lane = evidence["env"]["LANE"]
+                self.assertEqual(
+                    inputs["command"],
+                    f"bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh {lane}",
+                )
+                self.assertTrue(mounts[1].endswith(f"/{lane}:/ppu-pr-cache"))
+                self.assertEqual(evidence["if"], "always()")
+                self.assertNotIn("continue-on-error", evidence)
+                self.assertEqual(
+                    evidence["env"]["WORKER_OUTCOME"], "${{ steps.worker.outcome }}"
+                )
+                self.assertEqual(
+                    job["outputs"]["evidence_ok"],
+                    "${{ steps.evidence.outputs.evidence_ok }}",
+                )
+                kernel = (
+                    "${{ needs.check-changes.outputs.ppu_kernel }}"
+                    if lane == "body"
+                    else "false"
+                )
+                self.assertEqual(evidence["env"]["KERNEL"], kernel)
+                self.assertIn(f"PPU_RUN_KERNEL={kernel},", inputs["extra_env"])
+                for secret in ("PPU_ARTIFACTORY_USER", "PPU_ARTIFACTORY_PASSWORD"):
+                    self.assertIn(
+                        f"{secret}=${{{{ secrets.{secret} }}}}", inputs["extra_env"]
+                    )
+                    self.assertEqual(
+                        evidence["env"][secret], f"${{{{ secrets.{secret} }}}}"
+                    )
+                upload = next(
+                    s
+                    for s in job["steps"]
+                    if s.get("uses") == "actions/upload-artifact@v4"
+                )
+                self.assertEqual(upload["if"], "always()")
+                self.assertNotIn("continue-on-error", upload)
+                self.assertEqual(upload["with"]["if-no-files-found"], "error")
+                self.assertEqual(upload["with"]["path"], mounts[0].split(":")[0])
+                self.assertEqual(upload["with"]["retention-days"], 14)
 
     def test_local_model_missing_files_fail_without_download(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
