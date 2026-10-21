@@ -106,6 +106,22 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertGreater(report["files"][0]["failures"], 0)
 
+    def test_continue_after_collection_error_stays_red(self):
+        broken = self.root / "test_broken.py"
+        healthy = self.root / "test_healthy.py"
+        broken.write_text("import missing_ppu_fixture_dependency\n")
+        healthy.write_text("def test_ok(): pass\n")
+        directory = self.root / "results"
+        result = RUNNER.run_pytest_files(
+            [broken, healthy], directory, 15, continue_on_error=True
+        )
+        report = json.loads((directory / "summary.json").read_text())
+        self.assertEqual(result, 1)
+        self.assertFalse(report["success"])
+        self.assertEqual(len(report["files"]), 2)
+        self.assertFalse(report["files"][0]["passed"])
+        self.assertTrue(report["files"][1]["passed"])
+
     def test_timeout(self):
         result, report = self.run_fixture(
             "import time\ndef test_wait(): time.sleep(60)\n", timeout=1
@@ -330,6 +346,76 @@ class FinalStatusTest(unittest.TestCase):
         needs["check-changes"]["outputs"].pop("ppu_multi")
         self.assertFalse(REPORT.aggregate(needs))
         self.assertFalse(REPORT.aggregate(self.needs({"ppu_multi"})))
+
+
+class CpuShortlistContractTest(unittest.TestCase):
+    def test_registration_inventory_and_runtime_ownership(self):
+        registry = load("shortlist_registry", "python/sglang/test/ci/ci_register.py")
+        files = [
+            str(path)
+            for path in (ROOT / "test/registered").rglob("*.py")
+            if path.name not in ("conftest.py", "__init__.py")
+        ]
+        registrations = registry.collect_tests(files, sanity_check=True)
+        cpu = [r for r in registrations if r.effective_suite == "stage-a-test-cpu-ppu"]
+        self.assertEqual(
+            {
+                str(Path(r.filename).relative_to(ROOT / "test/registered/ppu"))
+                for r in cpu
+            },
+            {
+                "test_ppu_constraints.py",
+                "test_ppu_environment_fingerprint_unit.py",
+                "accuracy_eval/test_ppu_accuracy_eval_unit.py",
+                "pd_perf_eval/test_ppu_pd_perf_eval_unit.py",
+                "pr/test_cpu_eval.py",
+            },
+        )
+        self.assertEqual(len(cpu), 5)
+        for registration in cpu:
+            self.assertEqual(registration.backend, registry.HWBackend.CPU)
+            self.assertIsNone(registration.disabled)
+            self.assertFalse(registration.nightly)
+        for name in (
+            "test_cpu_dispatch.py",
+            "test_cpu_pool_hooks.py",
+            "test_eval_runtime.py",
+        ):
+            owners = [r for r in registrations if Path(r.filename).name == name]
+            self.assertEqual(len(owners), 1)
+            self.assertEqual(owners[0].backend, registry.HWBackend.PPU)
+            self.assertEqual(owners[0].effective_suite, "stage-b-test-1-gpu-ppu")
+            self.assertIsNone(owners[0].disabled)
+
+    def test_evaluator_adapters_partition_all_original_classes(self):
+        def exports(adapter):
+            tree = ast.parse((ROOT / "test/registered/ppu/pr" / adapter).read_text())
+            return {
+                alias.name
+                for node in tree.body
+                if isinstance(node, ast.ImportFrom)
+                and (node.module or "").startswith("registered.ppu.")
+                for alias in node.names
+            }
+
+        cpu = exports("test_cpu_eval.py")
+        runtime = exports("test_eval_runtime.py")
+        self.assertEqual(cpu, {"TestPPUAnswerEval", "TestPPUPerfEval"})
+        self.assertEqual(
+            runtime, {"TestPPUAnswerMultiNodeExchange", "TestPPUPerfMultiNodeExchange"}
+        )
+        self.assertFalse(cpu & runtime)
+        original = set()
+        for name in ("answer", "perf"):
+            path = (
+                ROOT / f"test/registered/ppu/{name}_eval/test_ppu_{name}_eval_unit.py"
+            )
+            original.update(
+                node.name
+                for node in ast.parse(path.read_text()).body
+                if isinstance(node, ast.ClassDef) and node.name.startswith("Test")
+            )
+        self.assertEqual(cpu | runtime, original)
 
 
 class SetupContractTest(unittest.TestCase):

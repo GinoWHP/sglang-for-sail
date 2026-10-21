@@ -73,7 +73,7 @@ except ImportError:
 # breaks a config or a summary prefix should turn the PPU gate red immediately
 # rather than surface in a nightly measurement hours later.
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu-ppu")
+# PR adapters select evaluator tests on CPU and runtime-driver tests on PPU.
 
 DATA_ROOT = Path(__file__).parent
 CONFIG_DIR = DATA_ROOT / "configs"

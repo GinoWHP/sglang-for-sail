@@ -58,7 +58,7 @@ except ImportError:
 # threshold or a redaction rule should turn the PPU gate red immediately rather
 # than surface hours later in the nightly Answer run.
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu-ppu")
+# PR adapters select evaluator tests on CPU and runtime-driver tests on PPU.
 
 DATA_ROOT = Path(__file__).parent
 CONFIG_DIR = DATA_ROOT / "configs"

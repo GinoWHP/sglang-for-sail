@@ -46,6 +46,68 @@ class RunCiWorkflowContractTest(unittest.TestCase):
         self.assertIn("github.event.action == 'labeled'", workflow)
         self.assertIn("github.event.label.name != 'run-ci'", workflow)
 
+    def test_review_events_cannot_cancel_pr_execution(self):
+        concurrency = yaml.safe_load(self.read_workflow("ci.yaml"))["concurrency"]
+        self.assertTrue(concurrency["cancel-in-progress"])
+        script = r"""
+            const {template, github} = JSON.parse(process.argv[1]);
+            const group = template.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, expr) =>
+                Function('github', `return (${expr});`)(github));
+            process.stdout.write(group.trim());
+        """
+
+        def group(
+            event,
+            run_id,
+            action="synchronize",
+            label="",
+            state="approved",
+            actor="User",
+        ):
+            result = subprocess.run(
+                [
+                    "node",
+                    "-e",
+                    script,
+                    json.dumps(
+                        {
+                            "template": concurrency["group"],
+                            "github": {
+                                "event_name": event,
+                                "run_id": run_id,
+                                "event": {
+                                    "pull_request": {"number": 129},
+                                    "action": action,
+                                    "label": {"name": label},
+                                    "review": {"state": state, "user": {"type": actor}},
+                                },
+                            },
+                        }
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            )
+            return result.stdout
+
+        active = group("pull_request", 1)
+        self.assertEqual(active, group("pull_request", 2))
+        self.assertEqual(active, group("pull_request", 3, "labeled", "run-ci"))
+        self.assertNotEqual(
+            active, group("pull_request", 4, "labeled", "documentation")
+        )
+        for state, actor in (
+            ("approved", "User"),
+            ("commented", "User"),
+            ("approved", "Bot"),
+        ):
+            with self.subTest(state=state, actor=actor):
+                self.assertNotEqual(
+                    active, group("pull_request_review", 5, state=state, actor=actor)
+                )
+
     def test_cpu_precheck_runs_before_label_authorization(self):
         jobs = yaml.safe_load(self.read_workflow("ci.yaml"))["jobs"]
         cpu = jobs["cpu-precheck"]
@@ -440,9 +502,16 @@ class PpuPathSelectionTest(unittest.TestCase):
         kernel = single | {"ppu_kernel"}
         multi = kernel | {"ppu_multi"}
         cases = [
-            (["test/registered/unit/server_args/test_server_args.py"], cpu),
-            (["python/sglang/srt/parser/reasoning_parser.py"], cpu),
-            (["test/ppu/module/test_ppu_deepep_hooks.py"], cpu),
+            (["test/registered/ppu/pr/test_cpu_eval.py"], cpu),
+            (["test/registered/ppu/test_ppu_constraints.py"], cpu),
+            (["test/registered/unit/server_args/test_server_args.py"], single),
+            (["python/sglang/srt/parser/reasoning_parser.py"], single),
+            (["test/ppu/module/test_ppu_deepep_hooks.py"], single),
+            (["test/registered/ppu/pr/test_cpu_dispatch.py"], single),
+            (["test/registered/ppu/pr/test_cpu_pool_hooks.py"], single),
+            (["test/registered/ppu/pr/test_eval_runtime.py"], single),
+            (["test/registered/ppu/answer_eval/test_ppu_answer_eval_unit.py"], single),
+            (["test/registered/ppu/perf_eval/test_ppu_perf_eval_unit.py"], single),
             (
                 [
                     "test/registered/ppu/pr/test_cpu_dispatch.py",

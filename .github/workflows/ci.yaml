@@ -15,10 +15,11 @@ permissions:
   actions: read
 
 concurrency:
+  # Review-only runs must not cancel CPU/hardware jobs they do not schedule.
   # Ignored review and unrelated-label events use a per-run suffix so they
   # cannot cancel active PR CI.
   group: >-
-    ci-${{ github.event.pull_request.number }}-${{
+    ci-${{ github.event.pull_request.number }}-${{ github.event_name }}-${{
     ((github.event_name == 'pull_request_review' &&
     (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot')) ||
     (github.event_name == 'pull_request' && github.event.action == 'labeled' &&

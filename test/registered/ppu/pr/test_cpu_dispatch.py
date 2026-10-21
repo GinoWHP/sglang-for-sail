@@ -1,4 +1,4 @@
-"""Explicit CPU adapters; source locations and their real assertions are preserved."""
+"""Legacy CPU-data adapter; real runtime imports require the PPU SDK."""
 
 import importlib
 import sys
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_ppu_ci
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from ppu.unit.test_deepseek_v4_dspark_quant_metadata import (  # noqa: E402,F401
@@ -18,7 +18,8 @@ from ppu.unit.test_dsa_prefill_graph_int8 import (  # noqa: E402,F401
     TestDsaPrefillGraphInt8,
 )
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu-ppu")
+# The real-import preflight needs the PPU SDK, even though assertions use CPU data.
+register_ppu_ci(est_time=10, suite="stage-b-test-1-gpu-ppu")
 
 # The standalone candidates mock dispatch boundaries/extract metadata. Require
 # real checkout imports first so those techniques cannot hide broken imports in
