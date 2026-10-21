@@ -262,13 +262,15 @@ jobs:
   # job container. Pin all three lanes to the same reviewed action revision.
   # Shared NAS remains writable by explicit policy; PR cache/evidence paths are
   # separate destinations, not a filesystem access-control boundary.
+  # Allow cold dependency/kernel setup while keeping test-suite limits unchanged.
+  # Each worker deadline leaves five minutes for orchestration and evidence.
   stage-a-test-1-gpu-ppu:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.ppu_single == 'true' && needs.pr-gate.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 12
+    timeout-minutes: 45
     outputs:
       evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
@@ -301,7 +303,7 @@ jobs:
           MATRIX_JSON: ${{ toJSON(matrix) }}
           PPU_ENV_NAMESPACE: ppu-sched
           PPU_ENV_PR_TIMINGS: 'true'
-          PPU_ENV_OBSERVER_LIMIT: '540'
+          PPU_ENV_OBSERVER_LIMIT: '2400'
         run: |
           if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
             echo 'Missing immutable worker image identity.' >&2
@@ -326,7 +328,7 @@ jobs:
           container_options: |
             host_ipc: true
             shm_size: 8Gi
-          timeout_minutes: 9
+          timeout_minutes: 40
           cleanup_policy: always
       - name: Validate evidence
         id: evidence
@@ -370,7 +372,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 25
+    timeout-minutes: 60
     outputs:
       evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
@@ -403,7 +405,7 @@ jobs:
           MATRIX_JSON: ${{ toJSON(matrix) }}
           PPU_ENV_NAMESPACE: ppu-sched
           PPU_ENV_PR_TIMINGS: 'true'
-          PPU_ENV_OBSERVER_LIMIT: '1320'
+          PPU_ENV_OBSERVER_LIMIT: '3300'
         run: |
           if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
             echo 'Missing immutable worker image identity.' >&2
@@ -428,7 +430,7 @@ jobs:
           container_options: |
             host_ipc: true
             shm_size: 8Gi
-          timeout_minutes: 22
+          timeout_minutes: 55
           cleanup_policy: always
       - name: Validate evidence
         id: evidence
@@ -473,7 +475,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     outputs:
       evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
     steps:
@@ -506,7 +508,7 @@ jobs:
           MATRIX_JSON: ${{ toJSON(matrix) }}
           PPU_ENV_NAMESPACE: ppu-sched
           PPU_ENV_PR_TIMINGS: 'true'
-          PPU_ENV_OBSERVER_LIMIT: '1020'
+          PPU_ENV_OBSERVER_LIMIT: '3300'
         run: |
           if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ || "$PPU_BASE_IMAGE_REF" != *@sha256:* ]]; then
             echo 'Missing immutable worker image identity.' >&2
@@ -531,7 +533,7 @@ jobs:
           container_options: |
             host_ipc: true
             shm_size: 8Gi
-          timeout_minutes: 17
+          timeout_minutes: 55
           cleanup_policy: always
       - name: Validate evidence
         id: evidence

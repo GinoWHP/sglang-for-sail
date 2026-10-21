@@ -567,7 +567,7 @@ class PpuPathSelectionTest(unittest.TestCase):
                     f"needs.{prerequisite}.result == 'success'", jobs[job]["if"]
                 )
             self.assertIn("!cancelled()", jobs[job]["if"])
-        for job, cap in ((cpu, 10), (smoke, 12), (body, 25), (multi, 20)):
+        for job, cap in ((cpu, 10), (smoke, 45), (body, 60), (multi, 60)):
             self.assertEqual(jobs[job]["timeout-minutes"], cap)
             self.assertIn("evidence_ok", jobs[job]["outputs"])
             self.assertIn(job, jobs["pr-test-ppu-finish"]["needs"])
@@ -578,10 +578,10 @@ class PpuPathSelectionTest(unittest.TestCase):
                 action["uses"], r"^flytiger-eco/ppu-distributed-action@[a-f0-9]{40}$"
             )
             self.assertEqual(
-                action["with"]["timeout_minutes"], {smoke: 9, body: 22, multi: 17}[job]
+                action["with"]["timeout_minutes"], {smoke: 40, body: 55, multi: 55}[job]
             )
-            self.assertLess(
-                action["with"]["timeout_minutes"], jobs[job]["timeout-minutes"]
+            self.assertGreaterEqual(
+                jobs[job]["timeout-minutes"] - action["with"]["timeout_minutes"], 5
             )
         self.assertEqual(jobs[cpu]["runs-on"], "ubuntu-latest")
 
