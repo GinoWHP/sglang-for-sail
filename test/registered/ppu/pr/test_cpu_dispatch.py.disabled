@@ -1,5 +1,8 @@
 """Legacy CPU-data adapter; real runtime imports require the PPU SDK."""
 
+# Disabled in PR CI at the owner's request: the real-runtime preflight exposes
+# a fused_experts circular import. Restore the .py suffix to re-enable coverage.
+
 import importlib
 import sys
 from pathlib import Path

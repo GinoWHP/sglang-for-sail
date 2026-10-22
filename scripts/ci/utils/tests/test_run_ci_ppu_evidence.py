@@ -532,8 +532,24 @@ class CpuShortlistContractTest(unittest.TestCase):
             self.assertEqual(registration.backend, registry.HWBackend.CPU)
             self.assertIsNone(registration.disabled)
             self.assertFalse(registration.nightly)
+        body = [
+            r for r in registrations if r.effective_suite == "stage-b-test-1-gpu-ppu"
+        ]
+        self.assertEqual(
+            {Path(r.filename).name for r in body},
+            {
+                "test_ppu_fa3_eval.py",
+                "test_serving.py",
+                "test_cpu_pool_hooks.py",
+                "test_eval_runtime.py",
+            },
+        )
+        self.assertEqual(len(body), 4)
+        self.assertTrue(all(r.disabled is None and not r.nightly for r in body))
+        self.assertFalse(
+            (ROOT / "test/registered/ppu/pr/test_cpu_dispatch.py").exists()
+        )
         for name in (
-            "test_cpu_dispatch.py",
             "test_cpu_pool_hooks.py",
             "test_eval_runtime.py",
         ):
@@ -616,7 +632,7 @@ class LegacyAdapterImportContractTest(unittest.TestCase):
         from importlib.machinery import SourceFileLoader
 
         inventory = {
-            "test_cpu_dispatch.py": {
+            "test_cpu_dispatch.py.disabled": {
                 "unit/test_deepseek_v4_dspark_quant_metadata.py": (
                     "TestDequantSupported",
                     "TestDsparkV4QuantMetadata",
