@@ -223,6 +223,16 @@ class StrictRunnerTest(unittest.TestCase):
         for name, value in metadata.items():
             (self.root / name).write_text(json.dumps(value))
         self.assertEqual(REPORT.verify(self.root, "cpu")["executed"], 1)
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "export"
+            REPORT.export_evidence(self.root, destination)
+            self.assertEqual(REPORT.verify(destination, "cpu")["executed"], 1)
+            (destination / "worker.json").write_text('{"exit_code":1,"elapsed":1}')
+            with self.assertRaises(ValueError):
+                REPORT.verify(destination, "cpu")
+            (destination / "worker.json").unlink()
+            with self.assertRaises(FileNotFoundError):
+                REPORT.verify(destination, "cpu")
         for name in metadata:
             path = self.root / name
             original = path.read_text()
@@ -236,6 +246,145 @@ class StrictRunnerTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             REPORT.verify(self.root, "cpu")
+
+
+class EvidenceExportTest(unittest.TestCase):
+    def test_read_only_source_redaction_and_writable_summary(self):
+        with tempfile.TemporaryDirectory() as temp, patch.dict(
+            os.environ,
+            {
+                "PPU_ARTIFACTORY_PASSWORD": "export-fixture-value",
+                "GITHUB_STEP_SUMMARY": "",
+            },
+        ):
+            root = Path(temp)
+            source = root / "nas"
+            source.mkdir()
+            nested = source / "suite"
+            nested.mkdir()
+            files = {
+                source / "aot.json": '{"aot_seconds":600}',
+                source / "setup.json": '{"setup_seconds":626}',
+                source / "setup.log": "https://user:pass@host export-fixture-value",
+                source
+                / "environment-pods.timing.tsv": "2026-01-01T00:00:00Z\t2026-01-01T00:00:03Z\t2026-01-01T00:00:11Z\n",
+                source / "environment-pods.status": "export-fixture-value",
+                nested / "case.xml": '<testsuite><testcase name="ok"/></testsuite>',
+                nested / "case.log": "password=export-fixture-value",
+                source / "ignored.bin": "export-fixture-value",
+            }
+            for path, text in files.items():
+                path.write_text(text)
+                path.chmod(0o444)
+            nested.chmod(0o555)
+            source.chmod(0o555)
+            before = {p: (p.read_bytes(), p.stat()) for p in files}
+            try:
+                destination = root / "export"
+                REPORT.export_evidence(source, destination)
+                self.assertFalse((destination / "ignored.bin").exists())
+                for path in destination.rglob("*"):
+                    if path.is_file():
+                        text = path.read_text()
+                        self.assertNotIn("export-fixture-value", text)
+                        self.assertNotIn("user:pass", text)
+                        self.assertTrue(path.stat().st_mode & 0o200)
+                        self.assertEqual(path.stat().st_uid, os.getuid())
+                result = REPORT.summarize(destination, "smoke")
+                self.assertEqual(result["aot_seconds"], 600)
+                self.assertEqual(result["scheduling_seconds"], 3)
+                self.assertTrue((destination / "timing-summary.json").is_file())
+                self.assertFalse((source / "timing-summary.json").exists())
+                for path, (content, metadata) in before.items():
+                    self.assertEqual(path.read_bytes(), content)
+                    self.assertEqual(path.stat().st_mode, metadata.st_mode)
+                    self.assertEqual(path.stat().st_mtime_ns, metadata.st_mtime_ns)
+            finally:
+                source.chmod(0o755)
+                nested.chmod(0o755)
+
+    def test_links_and_special_files_never_publish_partial_export(self):
+        for kind in ("file-link", "directory-link", "broken-link", "hard-link", "fifo"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "nas"
+                source.mkdir()
+                (source / "a.log").write_text("safe diagnostic")
+                outside = root / "outside.log"
+                outside.write_text("private diagnostic")
+                entry = source / "z.log"
+                if kind == "file-link":
+                    entry.symlink_to(outside)
+                elif kind == "directory-link":
+                    entry.symlink_to(root, target_is_directory=True)
+                elif kind == "broken-link":
+                    entry.symlink_to(root / "missing")
+                elif kind == "hard-link":
+                    os.link(outside, entry)
+                else:
+                    os.mkfifo(entry)
+                destination = root / "export"
+                with self.assertRaises((ValueError, OSError)):
+                    REPORT.export_evidence(source, destination)
+                self.assertFalse(destination.exists())
+                self.assertFalse(list(root.glob(".ppu-export-*")))
+                self.assertEqual(outside.read_text(), "private diagnostic")
+
+    def test_missing_empty_nested_or_existing_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "nas"
+            destination = root / "export"
+            with self.assertRaises(FileNotFoundError):
+                REPORT.export_evidence(source, destination)
+            source.mkdir()
+            with self.assertRaisesRegex(ValueError, "No supported"):
+                REPORT.export_evidence(source, destination)
+            (source / "setup.log").write_text("safe diagnostic")
+            for target in (source, source / "nested", root):
+                with self.assertRaises(ValueError):
+                    REPORT.export_evidence(source, target)
+            link = root / "source-link"
+            link.symlink_to(source, target_is_directory=True)
+            with self.assertRaises(OSError):
+                REPORT.export_evidence(link, destination)
+            self.assertFalse(destination.exists())
+
+    def test_sanitizer_or_read_failure_cannot_publish(self):
+        for failure in ("sanitize", "read"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "nas"
+                source.mkdir()
+                (source / "a.log").write_text("safe diagnostic")
+                (source / "z.log").write_text("bad diagnostic")
+                destination = root / "export"
+                sanitize = REPORT.runner.sanitize
+                open_file = os.open
+
+                def clean(text):
+                    if text == "bad diagnostic":
+                        raise ValueError("sanitizer fixture failure")
+                    return sanitize(text)
+
+                def read_file(path, *args, **kwargs):
+                    if path == "z.log":
+                        raise PermissionError("read fixture failure")
+                    return open_file(path, *args, **kwargs)
+
+                target, side_effect = (
+                    ("runner.sanitize", clean)
+                    if failure == "sanitize"
+                    else ("os.open", read_file)
+                )
+                with patch.object(
+                    REPORT.runner if failure == "sanitize" else REPORT.os,
+                    target.split(".")[-1],
+                    side_effect=side_effect,
+                ), self.assertRaises((ValueError, PermissionError)):
+                    REPORT.export_evidence(source, destination)
+                self.assertFalse(destination.exists())
+                self.assertFalse(list(root.glob(".ppu-export-*")))
 
 
 class FinalStatusTest(unittest.TestCase):
@@ -585,22 +734,28 @@ class SetupContractTest(unittest.TestCase):
     def test_worker_failure_and_evidence_failure_cannot_publish_success(self):
         for name, job in self.hardware_jobs().items():
             evidence = next(s for s in job["steps"] if s.get("id") == "evidence")
-            for outcome, verify_rc in (
-                ("success", 0),
-                ("failure", 0),
-                ("cancelled", 0),
-                ("skipped", 0),
-                ("success", 1),
+            for outcome, export_rc, summary_rc, verify_rc in (
+                ("success", 0, 0, 0),
+                ("failure", 0, 0, 0),
+                ("cancelled", 0, 0, 0),
+                ("skipped", 0, 0, 0),
+                ("success", 0, 0, 1),
+                ("success", 0, 1, 0),
+                ("success", 1, 0, 0),
             ):
                 with self.subTest(
-                    job=name, outcome=outcome, verify_rc=verify_rc
+                    job=name,
+                    outcome=outcome,
+                    export_rc=export_rc,
+                    summary_rc=summary_rc,
+                    verify_rc=verify_rc,
                 ), tempfile.TemporaryDirectory() as temp:
                     directory = Path(temp)
                     stub = directory / "python3"
                     stub.write_text(
                         f"#!{sys.executable}\nimport os,sys\nfrom pathlib import Path\n"
                         "with Path(os.environ['CALL_LOG']).open('a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')\n"
-                        "sys.exit(int(os.environ['VERIFY_RC']) if sys.argv[2] == 'verify' else 0)\n"
+                        "sys.exit(int(os.environ[{'export':'EXPORT_RC','summarize':'SUMMARY_RC','verify':'VERIFY_RC'}[sys.argv[2]]]))\n"
                     )
                     stub.chmod(0o755)
                     output = directory / "output"
@@ -616,6 +771,9 @@ class SetupContractTest(unittest.TestCase):
                             "true" if evidence["env"]["LANE"] == "body" else "false"
                         ),
                         "WORKER_OUTCOME": outcome,
+                        "RUNNER_TEMP": str(directory),
+                        "EXPORT_RC": str(export_rc),
+                        "SUMMARY_RC": str(summary_rc),
                         "VERIFY_RC": str(verify_rc),
                         "GITHUB_OUTPUT": str(output),
                         "CALL_LOG": str(log),
@@ -635,17 +793,42 @@ class SetupContractTest(unittest.TestCase):
                         text=True,
                         timeout=10,
                     )
-                    valid = outcome == "success" and verify_rc == 0
-                    self.assertEqual(result.returncode == 0, valid, result.stderr)
-                    self.assertEqual(output.exists(), valid)
-                    if valid:
-                        self.assertEqual(output.read_text().strip(), "evidence_ok=true")
-                    calls = log.read_text().splitlines()
-                    self.assertEqual(
-                        [line.split()[1] for line in calls],
-                        ["sanitize", "summarize", "verify"],
+                    valid = outcome == "success" and not (
+                        export_rc or summary_rc or verify_rc
                     )
-                    self.assertEqual("--kernel" in calls[-1], env["KERNEL"] == "true")
+                    self.assertEqual(result.returncode == 0, valid, result.stderr)
+                    outputs = (
+                        dict(
+                            line.split("=", 1)
+                            for line in output.read_text().splitlines()
+                        )
+                        if output.exists()
+                        else {}
+                    )
+                    self.assertEqual(outputs.get("evidence_ok") == "true", valid)
+                    self.assertEqual(outputs.get("sanitized") == "true", export_rc == 0)
+                    calls = log.read_text().splitlines()
+                    modes = ["export"]
+                    if not export_rc:
+                        modes.append("summarize")
+                        if not summary_rc:
+                            modes.append("verify")
+                        artifact = outputs["artifact_directory"]
+                        self.assertTrue(
+                            artifact.startswith(str(directory) + "/ppu-evidence.")
+                        )
+                        self.assertTrue(artifact.endswith("/sanitized"))
+                        self.assertIn("--destination " + artifact, calls[0])
+                        for call in calls[1:]:
+                            self.assertIn("--directory " + artifact, call)
+                            self.assertNotIn("/wl_nas/", call)
+                    else:
+                        self.assertNotIn("artifact_directory", outputs)
+                    self.assertEqual([line.split()[1] for line in calls], modes)
+                    if modes[-1] == "verify":
+                        self.assertEqual(
+                            "--kernel" in calls[-1], env["KERNEL"] == "true"
+                        )
 
     def test_summary_separates_observed_and_unknown_timings(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -772,10 +955,16 @@ class SetupContractTest(unittest.TestCase):
                     for s in job["steps"]
                     if s.get("uses") == "actions/upload-artifact@v4"
                 )
-                self.assertEqual(upload["if"], "always()")
+                self.assertEqual(
+                    upload["if"],
+                    "always() && steps.evidence.outputs.sanitized == 'true'",
+                )
                 self.assertNotIn("continue-on-error", upload)
                 self.assertEqual(upload["with"]["if-no-files-found"], "error")
-                self.assertEqual(upload["with"]["path"], mounts[0].split(":")[0])
+                self.assertEqual(
+                    upload["with"]["path"],
+                    "${{ steps.evidence.outputs.artifact_directory }}",
+                )
                 self.assertEqual(upload["with"]["retention-days"], 14)
 
     def test_local_model_missing_files_fail_without_download(self):

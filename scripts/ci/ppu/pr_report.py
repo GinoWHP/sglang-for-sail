@@ -6,6 +6,8 @@ import importlib.util
 import json
 import os
 import re
+import stat
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +30,80 @@ JOBS = {
     "stage-b-test-1-gpu-ppu": "ppu_single",
     "stage-c-test-2-gpu-ppu": "ppu_multi",
 }
+
+
+def export_evidence(directory, destination):
+    """Read NAS evidence without rewriting it; publish only a complete local export."""
+    source = Path(directory)
+    destination = Path(destination).absolute()
+    source_resolved = source.resolve(strict=True)
+    target = destination.resolve()
+    if target == source_resolved or source_resolved in target.parents:
+        raise ValueError("Evidence export must be outside the source directory")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("Evidence export destination already exists")
+
+    def copy_directory(source_fd, output):
+        count = 0
+        for name in sorted(os.listdir(source_fd)):
+            # Names become artifact paths. Never follow links or publish secret names.
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+                or runner.sanitize(name) != name
+            ):
+                raise ValueError("Unsafe evidence entry name")
+            mode = os.stat(name, dir_fd=source_fd, follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                child_fd = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=source_fd
+                )
+                try:
+                    child = output / name
+                    child.mkdir(mode=0o700)
+                    count += copy_directory(child_fd, child)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(mode):
+                if Path(name).suffix not in (
+                    ".json",
+                    ".xml",
+                    ".log",
+                    ".tsv",
+                    ".status",
+                ):
+                    continue
+                fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=source_fd
+                )
+                with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
+                    metadata = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise ValueError(
+                            "Evidence must contain only single-link regular files"
+                        )
+                    cleaned = runner.sanitize(handle.read())
+                with (output / name).open("x", encoding="utf-8") as handle:
+                    handle.write(cleaned)
+                count += 1
+            else:
+                raise ValueError("Evidence links and special files are not allowed")
+        return count
+
+    source_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        # Fresh files inherit runner ownership, not NAS mode bits or ACLs.
+        # Staging stays outside the upload path until every retained file is sanitized.
+        with tempfile.TemporaryDirectory(
+            prefix=".ppu-export-", dir=destination.parent
+        ) as temp:
+            staging = Path(temp) / "evidence"
+            staging.mkdir(mode=0o700)
+            if not copy_directory(source_fd, staging):
+                raise ValueError("No supported evidence files to export")
+            staging.rename(destination)
+    finally:
+        os.close(source_fd)
+    return destination
 
 
 def verify(directory, lane, kernel=False):
@@ -235,9 +311,10 @@ def aggregate(needs, cpu_only=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "mode", choices=["verify", "aggregate", "sanitize", "summarize"]
+        "mode", choices=["verify", "aggregate", "sanitize", "summarize", "export"]
     )
     parser.add_argument("--directory")
+    parser.add_argument("--destination")
     parser.add_argument("--lane", choices=SUITES)
     parser.add_argument("--kernel", action="store_true")
     parser.add_argument("--cpu-only", action="store_true")
@@ -250,6 +327,10 @@ if __name__ == "__main__":
         verify(args.directory, args.lane, args.kernel)
     elif args.mode == "summarize":
         summarize(args.directory, args.lane)
+    elif args.mode == "export":
+        if not args.directory or not args.destination:
+            parser.error("export requires --directory and --destination")
+        export_evidence(args.directory, args.destination)
     else:
         for path in Path(args.directory).rglob("*"):
             if path.is_file() and path.suffix in (".json", ".xml", ".log"):
