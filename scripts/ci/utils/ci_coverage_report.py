@@ -630,7 +630,7 @@ def main():
     )
     parser.add_argument(
         "--section",
-        choices=["all", "summary", "by-folder", "by-suite"],
+        choices=["all", "summary", "by-folder", "by-suite", "provenance"],
         default="all",
         help="Which section to output (default: all). Only applies to markdown format.",
     )
@@ -654,14 +654,25 @@ def main():
     repo_root = script_dir.parent.parent
     os.chdir(repo_root)
 
-    tests = collect_all_tests(args.registered_dir)
-    if args.multimodal_gen_dir:
-        tests.extend(collect_multimodal_gen_tests(args.multimodal_gen_dir))
+    if args.section == "provenance":
+        import upstream_e2e_inventory as inventory
 
-    if args.output_format == "markdown":
-        report = generate_markdown_report(tests, section=args.section)
+        manifest = inventory.load()
+        inventory.validate(manifest)
+        report = (
+            inventory.report(manifest)
+            if args.output_format == "markdown"
+            else inventory.render(manifest)
+        )
     else:
-        report = generate_json_report(tests)
+        tests = collect_all_tests(args.registered_dir)
+        if args.multimodal_gen_dir:
+            tests.extend(collect_multimodal_gen_tests(args.multimodal_gen_dir))
+
+        if args.output_format == "markdown":
+            report = generate_markdown_report(tests, section=args.section)
+        else:
+            report = generate_json_report(tests)
 
     print(report)
 

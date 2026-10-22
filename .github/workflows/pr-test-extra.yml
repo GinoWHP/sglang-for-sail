@@ -299,5 +299,5 @@ jobs:
         run: |
           gh workflow run pr-states.yml \
             --repo ${{ github.repository }} \
-            --ref main \
+            --ref "${{ github.event.repository.default_branch }}" \
             -f pr_number="$PR_NUMBER"

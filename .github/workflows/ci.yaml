@@ -60,6 +60,10 @@ jobs:
         env:
           NODE_PATH: ${{ runner.temp }}/ppu-ci-filter-tests/node_modules
         run: python3 -m unittest discover -s scripts/ci/utils/tests -p 'test_run_ci_*.py' -v
+      - name: Verify inventory against the pinned upstream tree
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/sgl-project/sglang.git 71de97b264b04dcd514cf904003028aefe9775c8
+          python3 scripts/ci/utils/upstream_e2e_inventory.py --verify-baseline
 
   # CPU validation runs without run-ci or private worker credentials. Reuse the
   # same path selector as hardware CI so documentation-only PRs skip the suite.
@@ -94,7 +98,7 @@ jobs:
           retention-days: 14
 
   cpu-precheck:
-    name: CPU Shortlist
+    name: PPU CPU Shortlist
     needs: [precheck, e2e-selection]
     if: github.event_name == 'pull_request' && needs.e2e-selection.outputs.ready == 'true'
     uses: ./.github/workflows/pr-test-ppu.yml
@@ -124,7 +128,7 @@ jobs:
   # The selected CPU suite must also pass, including evidence validation. Only
   # reuse its result from this workflow run; do not trust a previous PR revision.
   ci:
-    name: Full CI
+    name: PPU Full CI
     needs: [registration-validation, cpu-precheck, e2e-selection]
     if: >-
       github.event_name == 'pull_request' &&

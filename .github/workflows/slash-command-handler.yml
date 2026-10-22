@@ -23,6 +23,9 @@ jobs:
        contains(github.event.comment.body, '/rerun-group') ||
        contains(github.event.comment.body, '/rerun-test'))
     runs-on: ubuntu-latest
+    concurrency:
+      group: ppu-e2e-commands-${{ github.event.issue.number }}
+      cancel-in-progress: false
 
     steps:
       # SECURITY: issue_comment runs with pull-requests/actions write access.

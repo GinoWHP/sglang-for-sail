@@ -446,6 +446,7 @@ def main():
         output("plan_hash", plan["plan_hash"])
         summary = [
             "## PPU E2E selection",
+            "Source: PPU-configured. Selection is not execution evidence.",
             f"Command: {request['comment_id'] if request else '(none)'}",
             f"Selectors: {', '.join(request['selectors']) if request else '(none)'}",
             f"Selected executions: {len(plan['entries'])}",

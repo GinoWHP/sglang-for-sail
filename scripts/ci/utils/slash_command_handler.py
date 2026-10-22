@@ -449,8 +449,28 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   rerun_failed_jobs() is scoped to a single workflow run.
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
 
+    import ppu_rerun
+
     rerun_count = 0
+    try:
+        recovered, message = ppu_rerun.recover(
+            ppu_rerun.api_from_environment(),
+            pr.number,
+            comment.id,
+            head_sha,
+            comment.user.login,
+        )
+        rerun_count += int(recovered)
+        pr.create_issue_comment(message)
+    except Exception as error:
+        print(f"PPU recovery not submitted: {error}")
+        pr.create_issue_comment(
+            "PPU recovery not submitted; authorization, revision, or run state "
+            "could not be verified. See the command log."
+        )
     for run in runs:
+        if run.path == ppu_rerun.PIPELINE:
+            continue
         if run.status != "completed":
             continue
         if run.conclusion not in ("failure", "skipped"):
@@ -815,6 +835,25 @@ def detect_suite(file_path_from_test):
     with open(full_path, "r") as f:
         content = f.read()
 
+    from upstream_e2e_inventory import registrations
+
+    registries = registrations(full_path, content)
+    native = [
+        r
+        for r in registries
+        if r["backend"] in {"CUDA", "CPU"} and not r["suite"].endswith("-ppu")
+    ]
+    ppu = [
+        r for r in registries if r["backend"] == "PPU" or r["suite"].endswith("-ppu")
+    ]
+    if (ppu or "/ppu/" in full_path) and not native:
+        return [
+            _dispatch_err(
+                None,
+                "PPU-configured cases use the PPU baseline or /run-ppu-e2e, not native /rerun-test or /rerun-group.",
+            )
+        ]
+
     cuda_calls = _extract_runner_configs(content)
     if cuda_calls:
         results = []
@@ -994,7 +1033,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "reply_marker": reply_marker,
         }
         if is_fork:
-            ref = "main"
+            ref = gh_repo.default_branch
             pr_head_sha = pr.head.sha
             inputs["pr_head_sha"] = pr_head_sha
         else:

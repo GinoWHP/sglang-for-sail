@@ -31,6 +31,11 @@ jobs:
         run: |
           python scripts/ci/utils/ci_coverage_report.py --section summary
 
+      - name: Report pinned upstream and PPU provenance
+        run: |
+          pip install PyYAML
+          python scripts/ci/utils/ci_coverage_report.py --section provenance
+
   by-folder:
     name: Tests by Folder
     runs-on: ubuntu-latest

@@ -364,7 +364,10 @@ def main():
         print(text)
         if os.environ.get("GITHUB_STEP_SUMMARY"):
             with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
-                stream.write("## Verified PPU E2E executions\n" + text + "\n")
+                stream.write(
+                    "## Verified PPU E2E executions\n"
+                    "Source: PPU-configured\n" + text + "\n"
+                )
         output("evidence_ok", "true")
 
 

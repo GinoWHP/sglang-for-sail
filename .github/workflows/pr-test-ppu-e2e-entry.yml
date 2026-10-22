@@ -37,6 +37,7 @@ env:
 
 jobs:
   execute:
+    name: PPU E2E (${{ inputs.entry }})
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
