@@ -15,7 +15,8 @@ register_ppu_ci(est_time=180, suite="stage-b-test-1-gpu-ppu")
 
 @pytest.fixture(scope="module")
 def base():
-    with server() as url:
+    # Keep the bounded grammar smoke test focused on compact schema output.
+    with server(compact_json=True) as url:
         yield url
 
 

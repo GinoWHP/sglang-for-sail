@@ -67,7 +67,7 @@ def request(base, method, path, **kwargs):
 
 
 @contextmanager
-def server(tp=1, startup_timeout=150, bounded=True):
+def server(tp=1, startup_timeout=150, bounded=True, *, compact_json=False):
     from sglang.srt.utils import kill_process_tree
 
     port = free_port()
@@ -107,6 +107,8 @@ def server(tp=1, startup_timeout=150, bounded=True):
             "--watchdog-timeout",
             "90",
         ]
+    if compact_json:
+        args.append("--constrained-json-disable-any-whitespace")
     process = subprocess.Popen(
         args, env=dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     )

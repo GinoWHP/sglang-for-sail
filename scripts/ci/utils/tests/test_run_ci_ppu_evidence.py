@@ -250,12 +250,15 @@ class StrictRunnerTest(unittest.TestCase):
 
 class EvidenceExportTest(unittest.TestCase):
     def test_read_only_source_redaction_and_writable_summary(self):
-        with tempfile.TemporaryDirectory() as temp, patch.dict(
-            os.environ,
-            {
-                "PPU_ARTIFACTORY_PASSWORD": "export-fixture-value",
-                "GITHUB_STEP_SUMMARY": "",
-            },
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(
+                os.environ,
+                {
+                    "PPU_ARTIFACTORY_PASSWORD": "export-fixture-value",
+                    "GITHUB_STEP_SUMMARY": "",
+                },
+            ),
         ):
             root = Path(temp)
             source = root / "nas"
@@ -377,11 +380,14 @@ class EvidenceExportTest(unittest.TestCase):
                     if failure == "sanitize"
                     else ("os.open", read_file)
                 )
-                with patch.object(
-                    REPORT.runner if failure == "sanitize" else REPORT.os,
-                    target.split(".")[-1],
-                    side_effect=side_effect,
-                ), self.assertRaises((ValueError, PermissionError)):
+                with (
+                    patch.object(
+                        REPORT.runner if failure == "sanitize" else REPORT.os,
+                        target.split(".")[-1],
+                        side_effect=side_effect,
+                    ),
+                    self.assertRaises((ValueError, PermissionError)),
+                ):
                     REPORT.export_evidence(source, destination)
                 self.assertFalse(destination.exists())
                 self.assertFalse(list(root.glob(".ppu-export-*")))
@@ -656,9 +662,10 @@ class SetupContractTest(unittest.TestCase):
                 ("runner-b", ""),
                 ("runner-b", '{"shard": 1}'),
             ):
-                with self.subTest(
-                    job=job, runner=runner_name, matrix=matrix
-                ), tempfile.TemporaryDirectory() as temp:
+                with (
+                    self.subTest(job=job, runner=runner_name, matrix=matrix),
+                    tempfile.TemporaryDirectory() as temp,
+                ):
                     directory = Path(temp)
                     normalized = "" if matrix == "null" else matrix
                     digest = hashlib.md5(
@@ -744,13 +751,16 @@ class SetupContractTest(unittest.TestCase):
                 ("success", 0, 1, 0),
                 ("success", 1, 0, 0),
             ):
-                with self.subTest(
-                    job=name,
-                    outcome=outcome,
-                    export_rc=export_rc,
-                    summary_rc=summary_rc,
-                    verify_rc=verify_rc,
-                ), tempfile.TemporaryDirectory() as temp:
+                with (
+                    self.subTest(
+                        job=name,
+                        outcome=outcome,
+                        export_rc=export_rc,
+                        summary_rc=summary_rc,
+                        verify_rc=verify_rc,
+                    ),
+                    tempfile.TemporaryDirectory() as temp,
+                ):
                     directory = Path(temp)
                     stub = directory / "python3"
                     stub.write_text(
@@ -844,8 +854,9 @@ class SetupContractTest(unittest.TestCase):
                         )
 
     def test_summary_separates_observed_and_unknown_timings(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"GITHUB_STEP_SUMMARY": ""}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": ""}),
         ):
             root = Path(directory)
             result = REPORT.summarize(root, "smoke")
@@ -995,9 +1006,73 @@ class SetupContractTest(unittest.TestCase):
                 )
                 self.assertEqual(upload["with"]["retention-days"], 14)
 
+    def test_compact_json_server_flag_is_opt_in(self):
+        flag = "--constrained-json-disable-any-whitespace"
+        for bounded in (True, False):
+            for compact in (None, False, True):
+                with self.subTest(bounded=bounded, compact=compact):
+                    process = Mock(pid=123, poll=Mock(return_value=None))
+                    cleanup = Mock()
+                    http = Mock(get=Mock(return_value=Mock(status_code=200)))
+                    options = {} if compact is None else {"compact_json": compact}
+                    with (
+                        patch.dict(
+                            sys.modules,
+                            {
+                                "sglang.srt.utils": Mock(kill_process_tree=cleanup),
+                                "requests": http,
+                            },
+                        ),
+                        patch.object(MODEL, "free_port", return_value=12345),
+                        patch.object(MODEL, "small_model", return_value="/model"),
+                        patch.object(
+                            MODEL.subprocess, "Popen", return_value=process
+                        ) as launch,
+                    ):
+                        with MODEL.server(bounded=bounded, **options) as base:
+                            self.assertEqual(base, "http://127.0.0.1:12345")
+                        launch.assert_called_once()
+                        args = launch.call_args.args[0]
+                        self.assertEqual(args.count(flag), int(compact is True))
+                        self.assertEqual("--grammar-backend" in args, bounded)
+                        self.assertEqual("--sampling-backend" in args, bounded)
+                        self.assertEqual(
+                            args[args.index("--attention-backend") + 1], "fa3"
+                        )
+                        self.assertEqual(
+                            launch.call_args.kwargs["env"]["HF_HUB_OFFLINE"], "1"
+                        )
+                        cleanup.assert_called_once_with(process.pid)
+                        process.wait.assert_called_once_with(timeout=15)
+
+    def test_serving_fixture_opts_into_compact_json(self):
+        from contextlib import nullcontext
+
+        tree = ast.parse((ROOT / "test/registered/ppu/pr/test_serving.py").read_text())
+        fixture = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "base"
+        )
+        fixture.decorator_list = []
+        launch = Mock(return_value=nullcontext("http://fixture"))
+        namespace = {"server": launch}
+        exec(
+            compile(
+                ast.Module(body=[fixture], type_ignores=[]), "<serving fixture>", "exec"
+            ),
+            namespace,
+        )
+        instance = namespace["base"]()
+        self.assertEqual(next(instance), "http://fixture")
+        with self.assertRaises(StopIteration):
+            next(instance)
+        launch.assert_called_once_with(compact_json=True)
+
     def test_local_model_missing_files_fail_without_download(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(
-            os.environ, {"PPU_SMALL_MODEL_PATH": directory}
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"PPU_SMALL_MODEL_PATH": directory}),
         ):
             with self.assertRaises(FileNotFoundError):
                 MODEL.small_model()
