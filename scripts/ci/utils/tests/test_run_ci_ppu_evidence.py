@@ -733,6 +733,7 @@ class SetupContractTest(unittest.TestCase):
 
     def test_worker_failure_and_evidence_failure_cannot_publish_success(self):
         for name, job in self.hardware_jobs().items():
+            export = next(s for s in job["steps"] if s.get("id") == "export")
             evidence = next(s for s in job["steps"] if s.get("id") == "evidence")
             for outcome, export_rc, summary_rc, verify_rc in (
                 ("success", 0, 0, 0),
@@ -778,33 +779,45 @@ class SetupContractTest(unittest.TestCase):
                         "GITHUB_OUTPUT": str(output),
                         "CALL_LOG": str(log),
                     }
-                    result = subprocess.run(
-                        [
-                            "bash",
-                            "--noprofile",
-                            "--norc",
-                            "-eo",
-                            "pipefail",
-                            "-c",
-                            evidence["run"],
-                        ],
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
+
+                    def run_step(step):
+                        step_output = output.with_name(step["id"] + "-output")
+                        result = subprocess.run(
+                            [
+                                "bash",
+                                "--noprofile",
+                                "--norc",
+                                "-eo",
+                                "pipefail",
+                                "-c",
+                                step["run"],
+                            ],
+                            env={**env, "GITHUB_OUTPUT": str(step_output)},
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        # Container-hook runners need not retain outputs of failed steps.
+                        outputs = (
+                            dict(
+                                line.split("=", 1)
+                                for line in step_output.read_text().splitlines()
+                            )
+                            if result.returncode == 0 and step_output.exists()
+                            else {}
+                        )
+                        return result, outputs
+
+                    result, outputs = run_step(export)
+                    self.assertEqual(result.returncode, export_rc, result.stderr)
+                    if not export_rc:
+                        env["PPU_ARTIFACT_DIR"] = outputs["artifact_directory"]
+                        result, validation_outputs = run_step(evidence)
+                        outputs.update(validation_outputs)
                     valid = outcome == "success" and not (
                         export_rc or summary_rc or verify_rc
                     )
                     self.assertEqual(result.returncode == 0, valid, result.stderr)
-                    outputs = (
-                        dict(
-                            line.split("=", 1)
-                            for line in output.read_text().splitlines()
-                        )
-                        if output.exists()
-                        else {}
-                    )
                     self.assertEqual(outputs.get("evidence_ok") == "true", valid)
                     self.assertEqual(outputs.get("sanitized") == "true", export_rc == 0)
                     calls = log.read_text().splitlines()
@@ -927,7 +940,19 @@ class SetupContractTest(unittest.TestCase):
                     f"bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh {lane}",
                 )
                 self.assertTrue(mounts[1].endswith(f"/{lane}:/ppu-pr-cache"))
-                self.assertEqual(evidence["if"], "always()")
+                export = next(s for s in job["steps"] if s.get("id") == "export")
+                self.assertEqual(export["if"], "always()")
+                self.assertNotIn("continue-on-error", export)
+                self.assertLess(
+                    job["steps"].index(export), job["steps"].index(evidence)
+                )
+                self.assertEqual(
+                    evidence["if"], "always() && steps.export.outcome == 'success'"
+                )
+                self.assertEqual(
+                    evidence["env"]["PPU_ARTIFACT_DIR"],
+                    "${{ steps.export.outputs.artifact_directory }}",
+                )
                 self.assertNotIn("continue-on-error", evidence)
                 self.assertEqual(
                     evidence["env"]["WORKER_OUTCOME"], "${{ steps.worker.outcome }}"
@@ -950,6 +975,9 @@ class SetupContractTest(unittest.TestCase):
                     self.assertEqual(
                         evidence["env"][secret], f"${{{{ secrets.{secret} }}}}"
                     )
+                    self.assertEqual(
+                        export["env"][secret], f"${{{{ secrets.{secret} }}}}"
+                    )
                 upload = next(
                     s
                     for s in job["steps"]
@@ -957,13 +985,13 @@ class SetupContractTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     upload["if"],
-                    "always() && steps.evidence.outputs.sanitized == 'true'",
+                    "always() && steps.export.outcome == 'success' && steps.export.outputs.sanitized == 'true'",
                 )
                 self.assertNotIn("continue-on-error", upload)
                 self.assertEqual(upload["with"]["if-no-files-found"], "error")
                 self.assertEqual(
                     upload["with"]["path"],
-                    "${{ steps.evidence.outputs.artifact_directory }}",
+                    "${{ steps.export.outputs.artifact_directory }}",
                 )
                 self.assertEqual(upload["with"]["retention-days"], 14)
 

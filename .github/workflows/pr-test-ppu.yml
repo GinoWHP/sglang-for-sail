@@ -330,13 +330,10 @@ jobs:
             shm_size: 8Gi
           timeout_minutes: 40
           cleanup_policy: always
-      - name: Validate evidence
-        id: evidence
+      - name: Export sanitized evidence
+        id: export
         if: always()
         env:
-          LANE: smoke
-          KERNEL: 'false'
-          WORKER_OUTCOME: ${{ steps.worker.outcome }}
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
         run: |
@@ -345,6 +342,18 @@ jobs:
           python3 scripts/ci/ppu/pr_report.py export --directory "$source" --destination "$directory"
           echo "artifact_directory=$directory" >> "$GITHUB_OUTPUT"
           echo 'sanitized=true' >> "$GITHUB_OUTPUT"
+      - name: Validate evidence
+        id: evidence
+        if: always() && steps.export.outcome == 'success'
+        env:
+          PPU_ARTIFACT_DIR: ${{ steps.export.outputs.artifact_directory }}
+          LANE: smoke
+          KERNEL: 'false'
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="$PPU_ARTIFACT_DIR"
           python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
           args=()
           [[ "$KERNEL" != true ]] || args+=(--kernel)
@@ -355,11 +364,11 @@ jobs:
           fi
           echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
       - name: Upload evidence
-        if: always() && steps.evidence.outputs.sanitized == 'true'
+        if: always() && steps.export.outcome == 'success' && steps.export.outputs.sanitized == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          path: ${{ steps.evidence.outputs.artifact_directory }}
+          path: ${{ steps.export.outputs.artifact_directory }}
           if-no-files-found: error
           retention-days: 14
 
@@ -435,13 +444,10 @@ jobs:
             shm_size: 8Gi
           timeout_minutes: 55
           cleanup_policy: always
-      - name: Validate evidence
-        id: evidence
+      - name: Export sanitized evidence
+        id: export
         if: always()
         env:
-          LANE: body
-          KERNEL: ${{ needs.check-changes.outputs.ppu_kernel }}
-          WORKER_OUTCOME: ${{ steps.worker.outcome }}
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
         run: |
@@ -450,6 +456,18 @@ jobs:
           python3 scripts/ci/ppu/pr_report.py export --directory "$source" --destination "$directory"
           echo "artifact_directory=$directory" >> "$GITHUB_OUTPUT"
           echo 'sanitized=true' >> "$GITHUB_OUTPUT"
+      - name: Validate evidence
+        id: evidence
+        if: always() && steps.export.outcome == 'success'
+        env:
+          PPU_ARTIFACT_DIR: ${{ steps.export.outputs.artifact_directory }}
+          LANE: body
+          KERNEL: ${{ needs.check-changes.outputs.ppu_kernel }}
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="$PPU_ARTIFACT_DIR"
           python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
           args=()
           [[ "$KERNEL" != true ]] || args+=(--kernel)
@@ -460,11 +478,11 @@ jobs:
           fi
           echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
       - name: Upload evidence
-        if: always() && steps.evidence.outputs.sanitized == 'true'
+        if: always() && steps.export.outcome == 'success' && steps.export.outputs.sanitized == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          path: ${{ steps.evidence.outputs.artifact_directory }}
+          path: ${{ steps.export.outputs.artifact_directory }}
           if-no-files-found: error
           retention-days: 14
 
@@ -541,13 +559,10 @@ jobs:
             shm_size: 8Gi
           timeout_minutes: 55
           cleanup_policy: always
-      - name: Validate evidence
-        id: evidence
+      - name: Export sanitized evidence
+        id: export
         if: always()
         env:
-          LANE: multi
-          KERNEL: 'false'
-          WORKER_OUTCOME: ${{ steps.worker.outcome }}
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
         run: |
@@ -556,6 +571,18 @@ jobs:
           python3 scripts/ci/ppu/pr_report.py export --directory "$source" --destination "$directory"
           echo "artifact_directory=$directory" >> "$GITHUB_OUTPUT"
           echo 'sanitized=true' >> "$GITHUB_OUTPUT"
+      - name: Validate evidence
+        id: evidence
+        if: always() && steps.export.outcome == 'success'
+        env:
+          PPU_ARTIFACT_DIR: ${{ steps.export.outputs.artifact_directory }}
+          LANE: multi
+          KERNEL: 'false'
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          directory="$PPU_ARTIFACT_DIR"
           python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
           args=()
           [[ "$KERNEL" != true ]] || args+=(--kernel)
@@ -566,11 +593,11 @@ jobs:
           fi
           echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
       - name: Upload evidence
-        if: always() && steps.evidence.outputs.sanitized == 'true'
+        if: always() && steps.export.outcome == 'success' && steps.export.outputs.sanitized == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-          path: ${{ steps.evidence.outputs.artifact_directory }}
+          path: ${{ steps.export.outputs.artifact_directory }}
           if-no-files-found: error
           retention-days: 14
 
