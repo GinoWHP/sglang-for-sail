@@ -1,0 +1,1944 @@
+From 82ab1875ac7c1716cb1813c1d5723c9152bcc544 Mon Sep 17 00:00:00 2001
+From: "billding.df" <billding.df@alibaba-inc.com>
+Date: Thu, 22 Oct 2026 15:49:40 +0800
+Subject: [PATCH 1/3] revert(build): drop the hgcc/sailify SAIL build stack
+
+Partially reverts d3e4720c40 ("feat(build): add initial T-head SAIL
+platform support"): the source-translation build stack is removed in
+favor of a CUDA-compatible SAIL platform that compiles directly with the
+PPU SDK's nvcc.
+
+Removed:
+- JIT sailify conversion (compile/sailify.py, loader hook, cache target
+  tag and environment fingerprint, hgcc flag filtering)
+- hgcc compiler discovery, --gpu-architecture selection and hggcrt link
+  flags in compile/toolchain.py
+- capability-based _sail_arch_suffix in JIT arch detection
+- SGLANG_SAIL_GPU_ARCH, the sailify entry in the srt_sail extra, and the
+  hgcc-era AOT setup_sail.py / pyproject_sail.toml
+
+The platform detection layer (PlatformEnum.SAIL, is_sail(),
+is_sail_runtime()) and every model-side SAIL integration stay in place.
+Follow-up commits re-land the CUDA-compatible JIT arch hook and the
+nvcc-based setup_sail.py.
+---
+ python/pyproject_other.toml                   |   1 -
+ python/sglang/kernels/aot/pyproject_sail.toml |  32 -
+ python/sglang/kernels/aot/setup_sail.py       | 545 ------------------
+ python/sglang/kernels/jit/utils/arch.py       |  20 +-
+ .../kernels/jit/utils/compile/__init__.py     |   5 -
+ .../sglang/kernels/jit/utils/compile/cache.py |  20 +-
+ .../kernels/jit/utils/compile/loader.py       |  46 +-
+ .../kernels/jit/utils/compile/sailify.py      | 237 --------
+ .../kernels/jit/utils/compile/toolchain.py    |  73 +--
+ python/sglang/srt/environ.py                  |   6 -
+ .../unit/platforms/test_platform_interface.py |  43 --
+ 11 files changed, 11 insertions(+), 1017 deletions(-)
+ delete mode 100644 python/sglang/kernels/aot/pyproject_sail.toml
+ delete mode 100644 python/sglang/kernels/aot/setup_sail.py
+ delete mode 100644 python/sglang/kernels/jit/utils/compile/sailify.py
+
+diff --git a/python/pyproject_other.toml b/python/pyproject_other.toml
+index ea0066a915..41d2152a24 100755
+--- a/python/pyproject_other.toml
++++ b/python/pyproject_other.toml
+@@ -152,7 +152,6 @@ srt_sail = [
+   "deep_gemm>=1.1.0",
+   "flash_attn_3",
+   "flash_mla",
+-  "sailify",
+   "sglang[runtime_common]",
+   "torch-for-sail",
+   "triton-for-sail",
+diff --git a/python/sglang/kernels/aot/pyproject_sail.toml b/python/sglang/kernels/aot/pyproject_sail.toml
+deleted file mode 100644
+index 9ad7b8fa03..0000000000
+--- a/python/sglang/kernels/aot/pyproject_sail.toml
++++ /dev/null
+@@ -1,32 +0,0 @@
+-[build-system]
+-requires = [
+-  "setuptools>=75.0",
+-  "scikit-build-core>=0.10",
+-  "torch>=2.8.0",
+-  "wheel",
+-]
+-build-backend = "setuptools.build_meta"
+-
+-[project]
+-name = "sglang-kernel"
+-version = "0.4.9"
+-description = "Kernel Library for SGLang"
+-readme = "README.md"
+-requires-python = ">=3.10"
+-license = { file = "LICENSE" }
+-classifiers = [
+-  "Programming Language :: Python :: 3",
+-  "License :: OSI Approved :: Apache Software License",
+-  "Environment :: GPU :: T-HEAD SAIL"
+-]
+-dependencies = []
+-
+-[project.urls]
+-"Homepage" = "https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot"
+-"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+-
+-[tool.wheel]
+-exclude = [
+-  "dist*",
+-  "tests*",
+-]
+diff --git a/python/sglang/kernels/aot/setup_sail.py b/python/sglang/kernels/aot/setup_sail.py
+deleted file mode 100644
+index 8989c820fa..0000000000
+--- a/python/sglang/kernels/aot/setup_sail.py
++++ /dev/null
+@@ -1,545 +0,0 @@
+-# Copyright 2025 SGLang Team. All Rights Reserved.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-# ==============================================================================
+-
+-import atexit
+-import os
+-import platform
+-import shutil
+-import subprocess
+-from pathlib import Path
+-
+-import torch
+-from setuptools import find_namespace_packages, setup
+-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+-
+-root = Path(__file__).parent.resolve()
+-third_party = Path(
+-    os.environ.get("SGL_KERNEL_THIRD_PARTY_DIR", root / "build" / "_deps")
+-)
+-arch = platform.machine().lower()
+-
+-# ======================= CUDA Version Detection ======================= #
+-cuda_version = torch.version.cuda
+-if cuda_version is None:
+-    raise RuntimeError("CUDA is not available in the current PyTorch installation.")
+-
+-cuda_version_tuple = tuple(int(x) for x in cuda_version.split(".")[:2])
+-print(f"Detected CUDA version: {cuda_version} ({cuda_version_tuple})")
+-
+-
+-# ======================= Third-Party Repository Info ======================= #
+-class _RepoInfo:
+-    """Configuration for a third-party git repository."""
+-
+-    def __init__(self, name, git_repository, git_tag, git_shallow=False):
+-        self.name = name
+-        self.git_repository = git_repository
+-        self.git_tag = git_tag
+-        self.git_shallow = git_shallow
+-        self.source_dir = third_party / name
+-
+-
+-_ACTLIZE_REPO = _RepoInfo(
+-    name="actlize",
+-    git_repository="https://github.com/t-head/actlize",
+-    git_tag="129651181ed29ec3d3e61df786f610926b739a9b",
+-    git_shallow=False,
+-)
+-
+-_ACTLIZE_DIR = Path(os.environ.get("SGL_KERNEL_ACTLIZE_DIR", _ACTLIZE_REPO.source_dir))
+-
+-_FLASHINFER_REPO = _RepoInfo(
+-    name="flashinfer",
+-    git_repository="https://github.com/flashinfer-ai/flashinfer.git",
+-    git_tag="bc29697ba20b7e6bdb728ded98f04788e16ee021",
+-    git_shallow=False,
+-)
+-
+-_TRITON_REPO = _RepoInfo(
+-    name="triton",
+-    git_repository="https://github.com/triton-lang/triton",
+-    git_tag="v3.7.0",
+-    git_shallow=False,
+-)
+-
+-ALL_REPOS = [
+-    _ACTLIZE_REPO,
+-    _FLASHINFER_REPO,
+-    _TRITON_REPO,
+-]
+-
+-
+-# ======================= Version ======================= #
+-def _get_version():
+-    with open(root / "pyproject_sail.toml") as f:
+-        for line in f:
+-            if line.startswith("version"):
+-                return line.split("=")[1].strip().strip('"')
+-    return "0.0.0"
+-
+-
+-# ======================= Build Configuration ======================= #
+-operator_namespace = "sgl-kernel"
+-
+-# Determine CXX ABI compatibility with PyTorch
+-torch_cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
+-abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}"
+-
+-enable_bf16 = os.environ.get("SGL_KERNEL_ENABLE_BF16", "1").lower() in (
+-    "1",
+-    "true",
+-    "on",
+-    "yes",
+-)
+-enable_fp8 = os.environ.get("SGL_KERNEL_ENABLE_FP8", "1").lower() in (
+-    "1",
+-    "true",
+-    "on",
+-    "yes",
+-)
+-compile_threads = int(os.environ.get("SGL_KERNEL_COMPILE_THREADS", "32"))
+-if compile_threads < 1:
+-    compile_threads = 1
+-
+-# ======================= hgcc (device compiler) Flags ======================= #
+-# No `-gencode`: hgcc takes `--gpu-architecture=ppu_XX` instead, and SAIL torch
+-# emits that itself from the PYTORCH_SAIL_ARCH environment variable (see
+-# torch.utils.cpp_extension._get_cuda_arch_flags). Passing a CUDA `-gencode` here
+-# makes hgcc fail outright, so the arch selection is left entirely to
+-# PYTORCH_SAIL_ARCH (`ppu_10`, `ppu_15`, or a semicolon-separated list).
+-sgl_kernel_cuda_flags = [
+-    "-DNDEBUG",
+-    f"-DOPERATOR_NAMESPACE={operator_namespace}",
+-    "-O3",
+-    "-Xcompiler",
+-    "-fPIC",
+-    "-std=c++17",
+-    "-DFLASHINFER_ENABLE_F16",
+-    "-DCUTE_USE_PACKED_TUPLE=1",
+-    "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
+-    "-DCUTLASS_VERSIONS_GENERATED",
+-    "-DCUTLASS_TEST_LEVEL=0",
+-    "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
+-    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+-    "--expt-relaxed-constexpr",
+-    "--expt-extended-lambda",
+-    "-U__HGGC_NO_HALF_OPERATORS__",
+-    "-U__HGGC_NO_HALF_CONVERSIONS__",
+-    "-U__HGGC_NO_HALF2_OPERATORS__",
+-    "-U__HGGC_NO_BFLOAT16_CONVERSIONS__",
+-    f"--threads={compile_threads}",
+-    # Suppress warnings
+-    "-Xcompiler=-Wno-clang-format-violations",
+-    "-Xcompiler=-Wno-conversion",
+-    "-Xcompiler=-Wno-deprecated-declarations",
+-    "-Xcompiler=-Wno-terminate",
+-    "-Xcompiler=-Wfatal-errors",
+-    "-Xcompiler=-ftemplate-backtrace-limit=1",
+-    # `-Xcudafe` is an nvcc-only hand-off to cudafe++, which hgcc has no
+-    # counterpart for and rejects. The diagnostics it used to suppress (177
+-    # unused-variable, 2361) are nvcc frontend numbers with no hgcc analogue.
+-    f"-Xcompiler={abi_flag}",
+-    abi_flag,
+-]
+-
+-if enable_bf16:
+-    sgl_kernel_cuda_flags.append("-DFLASHINFER_ENABLE_BF16")
+-
+-if enable_fp8:
+-    sgl_kernel_cuda_flags.extend(
+-        [
+-            "-DFLASHINFER_ENABLE_FP8",
+-            "-DFLASHINFER_ENABLE_FP8_E4M3",
+-            "-DFLASHINFER_ENABLE_FP8_E5M2",
+-        ]
+-    )
+-
+-# ======================= Include Directories ======================= #
+-# Upstream (non-sailified) include directories.  When sailify staging is
+-# active (see the "Sailify Source Staging" section below), the staged mirror
+-# directories are prepended so that converted headers shadow their upstream
+-# originals; the entries below then only act as a fallback for headers that
+-# were not part of the conversion closure.
+-base_include_dirs = [
+-    str(root / "include"),
+-    str(root / "csrc"),
+-    str(_ACTLIZE_DIR / "include"),
+-    str(_ACTLIZE_DIR / "tools" / "util" / "include"),
+-    str(_FLASHINFER_REPO.source_dir / "include"),
+-    str(_FLASHINFER_REPO.source_dir / "csrc"),
+-    str(_ACTLIZE_DIR / "examples" / "77_blackwell_fmha"),
+-    str(_ACTLIZE_DIR / "examples" / "common"),
+-]
+-
+-# ======================= Source Files ======================= #
+-common_sources = [
+-    "csrc/allreduce/custom_all_reduce.cu",
+-    "csrc/attention/merge_attn_states.cu",
+-    "csrc/common_extension_sail.cc",
+-    "csrc/elementwise/activation.cu",
+-    "csrc/elementwise/concat_mla.cu",
+-    "csrc/elementwise/copy.cu",
+-    "csrc/elementwise/fused_add_rms_norm_kernel.cu",
+-    "csrc/elementwise/pos_enc.cu",
+-    "csrc/elementwise/topk.cu",
+-    "csrc/gemm/per_token_group_quant_8bit.cu",
+-    "csrc/gemm/per_token_group_quant_8bit_v2.cu",
+-    "csrc/gemm/per_token_quant_fp8.cu",
+-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
+-    "csrc/kvcacheio/transfer.cu",
+-    "csrc/mamba/causal_conv1d.cu",
+-    "csrc/memory/weak_ref_tensor.cpp",
+-    "csrc/moe/moe_align_kernel.cu",
+-    "csrc/moe/fused_qknorm_rope_kernel.cu",
+-    "csrc/moe/moe_sum.cu",
+-    "csrc/moe/moe_sum_reduce.cu",
+-    "csrc/moe/moe_topk_softmax_kernels.cu",
+-    "csrc/moe/moe_topk_sigmoid_kernels.cu",
+-    "csrc/moe/prepare_moe_input.cu",
+-    "csrc/quantization/gguf/gguf_kernel.cu",
+-]
+-
+-# Third-party source files
+-flashinfer_sources = [
+-    str(_FLASHINFER_REPO.source_dir / "csrc" / "norm.cu"),
+-    str(_FLASHINFER_REPO.source_dir / "csrc" / "renorm.cu"),
+-]
+-
+-all_common_sources = common_sources + flashinfer_sources
+-
+-# Libraries to link.
+-#
+-# The cuda_free PPU SDK ships no libcuda/libcublas/libcublasLt; the sailified
+-# sources call the native spellings instead, so link their PPU counterparts:
+-#   cudart  -> hggcrt1   (libhggcrt1.so -> libhggcrt.13.0.so; there is no
+-#                         unversioned libhggcrt.so to satisfy a plain -lhggcrt)
+-#   cublas  -> acblas    (PPU counterpart of cublas)
+-#   cublasLt-> acblasLt
+-# The CUDA driver API (libcuda) is dropped: no csrc translation unit calls it.
+-# `library_paths()` from SAIL torch already contributes $PPU_SDK/lib, so no
+-# explicit library_dirs is needed.
+-libraries = ["c10", "hggcrt1", "hggc", "acblas", "acblasLt"]
+-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
+-
+-
+-# ======================= Extension Modules ======================= #
+-def _make_common_ops():
+-    """common_ops for SM80/SM89."""
+-    nvcc_flags = sgl_kernel_cuda_flags + ["-use_fast_math"]
+-    return CUDAExtension(
+-        name="sgl_kernel.common_ops",
+-        sources=staged_common_sources,
+-        include_dirs=include_dirs,
+-        extra_compile_args={
+-            "nvcc": nvcc_flags,
+-            "cxx": ["-O3", "-std=c++17", abi_flag],
+-        },
+-        libraries=libraries,
+-        extra_link_args=extra_link_args,
+-        py_limited_api=False,
+-    )
+-
+-
+-# ======================= Clone Third-Party Repositories ======================= #
+-def _clone_and_checkout(repo_path, repo_url, git_tag, git_shallow):
+-    """Clone a git repository and checkout a specific tag/commit."""
+-    repo_path = Path(repo_path)
+-    repo_path.parent.mkdir(parents=True, exist_ok=True)
+-    if not repo_path.exists():
+-        clone_cmd = ["git", "clone"]
+-        if git_shallow:
+-            clone_cmd += ["--depth", "1"]
+-        clone_cmd += [repo_url, str(repo_path)]
+-        print(f"Cloning {repo_url} -> {repo_path}")
+-        subprocess.check_call(clone_cmd)
+-        subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
+-
+-
+-if os.environ.get("SGL_KERNEL_SKIP_THIRD_PARTY", "0") != "1":
+-    for _repo in ALL_REPOS:
+-        _clone_and_checkout(
+-            _repo.source_dir,
+-            _repo.git_repository,
+-            _repo.git_tag,
+-            _repo.git_shallow,
+-        )
+-
+-
+-# ======================= Sailify Source Staging ======================= #
+-# The upstream sources (sglang aot + flashinfer) target CUDA; the cuda_free
+-# PPU SDK needs their hggc equivalents.  Rather than modifying the upstream
+-# trees, every compiled source file -- plus every header they recursively
+-# #include -- is converted by sailify into a mirror tree under
+-# build/sailified/, and the extensions compile exclusively from that tree:
+-#
+-#   build/sailified/.ppu_compat/             compat layer (generated)
+-#   build/sailified/csrc/...                 aot sources + headers
+-#   build/sailified/include/...              aot headers
+-#   build/sailified/flashinfer/csrc/...      flashinfer sources + headers
+-#   build/sailified/flashinfer/include/...   flashinfer headers
+-#
+-# The staging tree is wiped and rebuilt on every invocation so no stale
+-# output survives an upstream or sailify change.
+-
+-sailify_staging_dir = root / "build" / "sailified"
+-
+-# Sailify toggle.
+-#
+-# SGL_KERNEL_USE_SAILIFY (default "1") enables the automatic cuda->hggc
+-# staging conversion described below; "0" skips staging and compiles the
+-# upstream sources directly, which requires a pre-sailified tree
+-# (root/.ppu_compat, see the skip branch).  The legacy
+-# SGL_KERNEL_SKIP_SAILIFY variable is kept for backwards compatibility and
+-# takes precedence when explicitly set.
+-if "SGL_KERNEL_SKIP_SAILIFY" in os.environ:
+-    skip_sailify = os.environ["SGL_KERNEL_SKIP_SAILIFY"] == "1"
+-else:
+-    skip_sailify = os.environ.get("SGL_KERNEL_USE_SAILIFY", "1") != "1"
+-
+-# Targeted fixes applied to the *staged* copies after the generic sailify
+-# pass, for CUDA constructs the identifier-level mapping cannot express.
+-# The -U__HGGC_NO_HALF* flags in sgl_kernel_cuda_flags disable
+-# constructor-style half/bfloat16 conversions, so numeric casts must use the
+-# functional __float2half / __float2bfloat16 API instead.
+-_SAILIFY_PATCHES = {
+-    "csrc/moe/moe_sum_reduce.cu": [
+-        ("__half2float(__half(", "__half2float(__float2half("),
+-        ("__bfloat162float(__ppu_bfloat16(", "__bfloat162float(__float2bfloat16("),
+-    ],
+-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu": [
+-        ("-CUDART_INF_FP16", "__float2half(-INFINITY)"),
+-        ("-CUDART_INF_BF16", "__float2bfloat16(-INFINITY)"),
+-        ("__ppu_bfloat16(-INFINITY)", "__float2bfloat16(-INFINITY)"),
+-    ],
+-}
+-
+-
+-def _sailify_stage(tree_roots, source_files):
+-    """Convert *source_files* and their #include closure into the staging tree.
+-
+-    Args:
+-        tree_roots: {upstream_root: staged_subdir} -- each file under an
+-            upstream root is written to
+-            sailified_dir/staged_subdir/<relpath from the root>.
+-        source_files: absolute paths of the .cu/.cc/.cpp files to convert.
+-
+-    Returns:
+-        List of staged paths corresponding 1:1 to *source_files*.
+-    """
+-    try:
+-        from sailify.sailify_python import (
+-            _discover_includes,
+-            _ensure_ppu_compat,
+-            preprocessor,
+-        )
+-    except ImportError as exc:
+-        raise RuntimeError(
+-            "sailify is required for SAIL builds (pip install -e /path/to/sailify)"
+-        ) from exc
+-
+-    staging = str(sailify_staging_dir)
+-    if sailify_staging_dir.exists():
+-        shutil.rmtree(sailify_staging_dir)
+-    sailify_staging_dir.mkdir(parents=True)
+-
+-    # Longest root first so nested trees match the most specific entry.
+-    roots = sorted(
+-        ((os.path.realpath(r), sub) for r, sub in tree_roots.items()),
+-        key=lambda kv: -len(kv[0]),
+-    )
+-
+-    def _staged_path(src_path):
+-        """Map an upstream file to (staged_path, project_directory anchor).
+-
+-        The anchor is the directory that preprocessor must receive as
+-        project_directory so that output_directory + relpath(file, anchor)
+-        equals staged_path.
+-        """
+-        src_path = os.path.realpath(src_path)
+-        for base, sub in roots:
+-            if src_path.startswith(base + os.sep):
+-                rel = os.path.relpath(src_path, base)
+-                staged_rel = os.path.join(sub, rel) if sub else rel
+-                return os.path.join(staging, staged_rel), (
+-                    os.path.dirname(base) if sub else base
+-                )
+-        return None
+-
+-    # Directories used to resolve #include targets while walking the
+-    # dependency closure (mirrors the upstream -I layout).
+-    header_include_dirs = []
+-    for base, _sub in roots:
+-        for name in ("include", "csrc"):
+-            d = os.path.join(base, name)
+-            if os.path.isdir(d) and d not in header_include_dirs:
+-                header_include_dirs.append(d)
+-
+-    # BFS over the compiled sources and their #include closure.  Headers
+-    # outside the managed trees (system / torch / actlize SDK headers) are
+-    # resolved by the discovery walk but intentionally left unconverted.
+-    visited = {os.path.realpath(f) for f in source_files}
+-    pending = list(visited)
+-    stats = {}
+-    failures = []
+-    while pending:
+-        src_path = pending.pop(0)
+-        _discover_includes(src_path, header_include_dirs, visited, pending)
+-        mapped = _staged_path(src_path)
+-        if mapped is None:
+-            continue  # header outside the managed trees: used as-is
+-        staged_path, anchor = mapped
+-        result = preprocessor(
+-            output_directory=staging,
+-            filepath=src_path,
+-            all_files=[],
+-            stats=stats,
+-            clean_ctx=None,
+-            show_progress=False,
+-            project_directory=anchor,
+-        )
+-        if result.status != "ok":
+-            failures.append(f"{src_path}: {result.status}")
+-        elif not os.path.isfile(staged_path):
+-            failures.append(f"{src_path}: staged output {staged_path} missing")
+-
+-    if failures:
+-        raise RuntimeError("sailify staging failed:\n  " + "\n  ".join(failures))
+-
+-    # Regenerate the compat layer inside the staging tree.
+-    _ensure_ppu_compat(staging)
+-
+-    # Apply targeted post-sailify patches to the staged copies only; the
+-    # upstream trees are never touched.
+-    for rel_path, replacements in _SAILIFY_PATCHES.items():
+-        staged = sailify_staging_dir / rel_path
+-        if not staged.is_file():
+-            print(f"sailify: patch target missing (skipped): {rel_path}")
+-            continue
+-        text = staged.read_text()
+-        for old, new in replacements:
+-            text = text.replace(old, new)
+-        staged.write_text(text)
+-
+-    n_headers = max(len(stats.get("ppuified", [])) - len(source_files), 0)
+-    print(
+-        f"sailify: staged {len(source_files)} sources (+{n_headers} discovered "
+-        f"headers) into {sailify_staging_dir}"
+-    )
+-
+-    return [_staged_path(f)[0] for f in source_files]
+-
+-
+-if skip_sailify:
+-    # Compile the upstream sources as-is.  The target toolchain is not
+-    # necessarily the cuda_free PPU SDK (this may be a plain CUDA build), so
+-    # no fail-fast on .ppu_compat: if it exists (pre-generated for the PPU
+-    # cuda_free toolchain) it is prepended to shadow the CUDA headers, and
+-    # otherwise the upstream include layout is used unchanged.
+-    print("WARNING: sailify disabled, compiling upstream sources directly")
+-    staged_common_sources = [str(root / s) for s in common_sources] + flashinfer_sources
+-    ppu_compat_dir = root / ".ppu_compat"
+-    if ppu_compat_dir.is_dir():
+-        print(f"note: using existing compat layer {ppu_compat_dir}")
+-        include_dirs = [str(ppu_compat_dir)] + base_include_dirs
+-    else:
+-        include_dirs = list(base_include_dirs)
+-else:
+-    _staged = _sailify_stage(
+-        {
+-            root: "",  # aot tree mirrors directly onto the staging root
+-            _FLASHINFER_REPO.source_dir: "flashinfer",
+-        },
+-        [str(root / s) for s in common_sources] + flashinfer_sources,
+-    )
+-    staged_common_sources = _staged
+-    # Staged directories shadow their upstream originals.  .ppu_compat MUST
+-    # stay first: SAIL torch injects its own (possibly older) `.ppu_compat`
+-    # through torch.utils.cpp_extension.include_paths(), which lands after
+-    # the user include_dirs.  Both copies contain compatible_wrapper.h, and
+-    # SAIL torch also passes `-include compatible_wrapper.h` on the hgcc
+-    # command line -- the compiler resolves that through -I order, so a
+-    # stale compat layer shadowing ours breaks the build with e.g.
+-    # "no template named 'maximum' in namespace 'hggc'".
+-    include_dirs = [
+-        str(sailify_staging_dir / ".ppu_compat"),
+-        str(sailify_staging_dir / "include"),
+-        str(sailify_staging_dir / "csrc"),
+-        str(sailify_staging_dir / "flashinfer" / "include"),
+-        str(sailify_staging_dir / "flashinfer" / "csrc"),
+-    ] + base_include_dirs
+-
+-    # ======================= Post-Build Cleanup ======================= #
+-    # The build itself consumes the compat layer from
+-    # build/sailified/.ppu_compat (first -I entry above), but tooling on the
+-    # SAIL torch side may additionally drop a .ppu_compat directory into the
+-    # aot tree (it shows up on the hgcc -I line).  It is not part of the
+-    # upstream sources, so remove it after every compilation / packaging step
+-    # has finished.  In skip-sailify mode root/.ppu_compat is an optional
+-    # user-provided compat layer and must NOT be removed either (hence no
+-    # registration there).
+-    def _cleanup_upstream_ppu_compat():
+-        upstream_compat = root / ".ppu_compat"
+-        if upstream_compat.is_dir():
+-            shutil.rmtree(upstream_compat, ignore_errors=True)
+-            print(f"setup_sail: removed {upstream_compat} (post-build cleanup)")
+-
+-    atexit.register(_cleanup_upstream_ppu_compat)
+-
+-
+-# ======================= Build Extension Modules List ======================= #
+-ext_modules = [
+-    _make_common_ops(),
+-]
+-
+-
+-# ======================= Custom Build Extension ======================= #
+-class _CustomBuildExt(BuildExtension):
+-    """Custom build extension with ninja support."""
+-
+-    pass
+-
+-
+-# ======================= Package Discovery ======================= #
+-_triton_kernels_root = _TRITON_REPO.source_dir / "python" / "triton_kernels"
+-
+-_packages = find_namespace_packages(where="python")
+-_package_dir = {"": "python"}
+-
+-# Discover triton_kernels packages (may not exist before first clone)
+-if _triton_kernels_root.exists():
+-    _triton_pkgs = find_namespace_packages(
+-        where=str(_triton_kernels_root),
+-        exclude=["tests", "tests.*"],
+-    )
+-else:
+-    _triton_pkgs = ["triton_kernels"]
+-
+-for pkg in _triton_pkgs:
+-    _package_dir[pkg] = os.path.relpath(
+-        _triton_kernels_root / pkg.replace(".", os.sep), root
+-    )
+-_packages += _triton_pkgs
+-
+-
+-# ======================= Setup ======================= #
+-setup(
+-    name="sglang-kernel",
+-    version=_get_version(),
+-    packages=_packages,
+-    package_dir=_package_dir,
+-    ext_modules=ext_modules,
+-    cmdclass={"build_ext": _CustomBuildExt.with_options(use_ninja=True)},
+-    options={"bdist_wheel": {"py_limited_api": "cp310"}},
+-)
+diff --git a/python/sglang/kernels/jit/utils/arch.py b/python/sglang/kernels/jit/utils/arch.py
+index 40d39ed926..38cdc67add 100644
+--- a/python/sglang/kernels/jit/utils/arch.py
++++ b/python/sglang/kernels/jit/utils/arch.py
+@@ -71,14 +71,6 @@ def _jit_cuda_version() -> tuple[int, ...]:
+     return get_cuda_version()
+ 
+ 
+-def _sail_arch_suffix(major: int, minor: int) -> str:
+-    """SAIL devices below the SM89 capability require the arch-specific target
+-    variant for JIT compilation (the ``"a"`` suffix); SM89+ SAIL devices stay
+-    unsuffixed like HIP/MUSA.
+-    """
+-    return "a" if (major <= 8 and minor < 9) else ""
+-
+-
+ def _cuda_arch_suffix(major: int, minor: int) -> str:
+     """Mirror FlashInfer's `_normalize_cuda_arch`: 9.x/10.x+ -> "a"; 12.0 -> "f"
+     and 12.x (x>0) -> "a" (SM120/SM121 need separate cubins to avoid
+@@ -113,13 +105,11 @@ def _init_jit_cuda_arch_once():
+     # JIT builds target the exact local GPU, so the arch-specific target is
+     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
+     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.
+-    if is_hip_runtime() or is_musa_runtime():
+-        suffix = ""
+-    elif is_sail_runtime():
+-        suffix = _sail_arch_suffix(major, minor)
+-    else:
+-        suffix = _cuda_arch_suffix(major, minor)
+-
++    suffix = (
++        ""
++        if (is_hip_runtime() or is_musa_runtime())
++        else _cuda_arch_suffix(major, minor)
++    )
+     _CUDA_ARCH = ArchInfo(major, minor, suffix)
+ 
+ 
+diff --git a/python/sglang/kernels/jit/utils/compile/__init__.py b/python/sglang/kernels/jit/utils/compile/__init__.py
+index 823e7482cf..fe757b5904 100644
+--- a/python/sglang/kernels/jit/utils/compile/__init__.py
++++ b/python/sglang/kernels/jit/utils/compile/__init__.py
+@@ -12,12 +12,7 @@ Modules, in dependency order (there are no cycles)::
+     toolchain  compilers, tvm-ffi locations, platform base flags
+     ninja      generating and running build.ninja, reading its depfiles
+     cache      build_key / deps_key, cache layout, publication
+-    sailify    CUDA -> PPU source conversion for hgcc builds
+     loader     load_jit
+-
+-``sailify`` and ``cache`` reference each other lazily (the mirror digest uses
+-the cache's file digests; the environment fingerprint uses the sailify
+-version), so neither imports the other at module level.
+ """
+ 
+ from sglang.kernels.jit.utils.compile.cpp_args import (
+diff --git a/python/sglang/kernels/jit/utils/compile/cache.py b/python/sglang/kernels/jit/utils/compile/cache.py
+index 400541e23c..deba51e4c3 100644
+--- a/python/sglang/kernels/jit/utils/compile/cache.py
++++ b/python/sglang/kernels/jit/utils/compile/cache.py
+@@ -56,12 +56,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+ import msgspec
+ 
+ from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
+-from sglang.kernels.jit.utils.common import (
+-    cache_once,
+-    is_hip_runtime,
+-    is_musa_runtime,
+-    is_sail_runtime,
+-)
++from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_musa_runtime
+ from sglang.kernels.jit.utils.compile import toolchain
+ from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
+ from sglang.kernels.jit.utils.compile.spec import BuildSpec
+@@ -219,10 +214,6 @@ def _target_tag() -> str:
+     ``(major, minor)`` capability: the latter maps gfx940/gfx941/gfx942 onto a
+     single ``9.4``, which are three different compile targets.
+     """
+-    if is_sail_runtime():
+-        arch = envs.SGLANG_SAIL_GPU_ARCH.get()
+-        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in arch)
+-        return f"sail_{safe}"
+     if is_hip_runtime():
+         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
+     arch = get_jit_cuda_arch()
+@@ -241,14 +232,7 @@ def _environment_fingerprint() -> str:
+     different host compiler means different system headers and different host
+     codegen for otherwise identical inputs.
+     """
+-    if is_sail_runtime():
+-        # Imported lazily: sailify imports this module for file digests, so a
+-        # top-level import would be circular.
+-        from sglang.kernels.jit.utils.compile.sailify import sailify_version
+-
+-        arch = envs.SGLANG_SAIL_GPU_ARCH.get()
+-        target = f"hgcc:{arch}:sailify-{sailify_version()}"
+-    elif is_hip_runtime():
++    if is_hip_runtime():
+         target = f"hip:{toolchain.gpu_arch_name()}"
+     else:
+         arch = get_jit_cuda_arch()
+diff --git a/python/sglang/kernels/jit/utils/compile/loader.py b/python/sglang/kernels/jit/utils/compile/loader.py
+index 890851d1f1..7dffa00b47 100644
+--- a/python/sglang/kernels/jit/utils/compile/loader.py
++++ b/python/sglang/kernels/jit/utils/compile/loader.py
+@@ -14,14 +14,13 @@ from typing import TYPE_CHECKING, List, Tuple
+ import torch
+ 
+ from sglang.kernels.jit.utils.arch import get_default_target_flags
+-from sglang.kernels.jit.utils.common import is_hip_runtime, is_sail_runtime
+-from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
++from sglang.kernels.jit.utils.common import is_hip_runtime
++from sglang.kernels.jit.utils.compile import cache, ninja
+ from sglang.kernels.jit.utils.compile.paths import (
+     DEFAULT_CFLAGS,
+     DEFAULT_INCLUDE,
+     DEFAULT_LDFLAGS,
+ )
+-from sglang.kernels.jit.utils.compile.sailify import convert_cuda_sources
+ from sglang.kernels.jit.utils.compile.spec import BuildSpec, resolve_sources
+ from sglang.kernels.jit.utils.deps import REGISTERED_DEPENDENCIES
+ from sglang.srt.environ import envs
+@@ -96,21 +95,11 @@ def load_jit(
+         )
+ 
+     includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
+-    if is_sail_runtime():
+-        includes = toolchain.base_include_paths() + includes
+     for dep in sorted(set(extra_dependencies or [])):
+         if dep not in REGISTERED_DEPENDENCIES:
+             raise ValueError(f"Dependency {dep} is not registered.")
+         includes += REGISTERED_DEPENDENCIES[dep]()
+ 
+-    if is_sail_runtime() and cuda_files:
+-        resolved_cuda = list(resolve_sources(cuda_files))
+-        converted, sailify_flags = convert_cuda_sources(resolved_cuda, includes)
+-        cuda_files = converted  # absolute paths pass through resolve_sources below
+-        extra_cuda_cflags = (
+-            _filter_hgcc_cuda_flags(extra_cuda_cflags or []) + sailify_flags
+-        )
+-
+     module_args = tuple(str(arg) for arg in args)
+     spec = BuildSpec(
+         module_args=module_args,
+@@ -213,37 +202,6 @@ def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | No
+     return cache.find_prebuilt(scope=scope, module_name=spec.module_name)
+ 
+ 
+-# Verified against hgcc 2.2: it is an nvcc-style driver and accepts
+-# -Xcompiler, --use_fast_math, --expt-relaxed-constexpr and
+-# --expt-extended-lambda; the genuinely unsupported options are the
+-# nvcc-specific code-generation and ptxas ones below.
+-_HGCC_DROP_WITH_ARG = frozenset({"-Xptxas"})
+-_HGCC_DROP_PREFIX = ("-gencode", "--generate-code")
+-
+-
+-def _filter_hgcc_cuda_flags(flags: List[str]) -> List[str]:
+-    """Drop nvcc-only flags hgcc would not understand; keep everything else."""
+-    kept: List[str] = []
+-    dropped: List[str] = []
+-    skip_next = False
+-    for flag in flags:
+-        if skip_next:
+-            skip_next = False
+-            dropped.append(flag)
+-            continue
+-        if flag in _HGCC_DROP_WITH_ARG:
+-            skip_next = True
+-            dropped.append(flag)
+-            continue
+-        if flag.startswith(_HGCC_DROP_PREFIX):
+-            dropped.append(flag)
+-            continue
+-        kept.append(flag)
+-    if dropped:
+-        logger.warning("Dropping nvcc-only flags hgcc does not accept: %s", dropped)
+-    return kept
+-
+-
+ @contextlib.contextmanager
+ def _build_lock(scope: pathlib.Path):
+     """Serialize builds of one module variant across processes.
+diff --git a/python/sglang/kernels/jit/utils/compile/sailify.py b/python/sglang/kernels/jit/utils/compile/sailify.py
+deleted file mode 100644
+index 8aa2721278..0000000000
+--- a/python/sglang/kernels/jit/utils/compile/sailify.py
++++ /dev/null
+@@ -1,237 +0,0 @@
+-"""Convert CUDA sources with sailify before they are handed to hgcc.
+-
+-hgcc cannot read CUDA: identifiers, API names and header paths first have to
+-be rewritten by sailify. Two properties of the converter shape everything in
+-this module:
+-
+-* ``sailify_extra_files_recursive`` converts **in place** — its per-file
+-  output path is ``join(output_directory, relpath(input, output_directory))``,
+-  which normalizes back onto the input itself; only the generated
+-  ``.ppu_compat/`` headers actually land in ``output_directory``. The kernel
+-  sources in the tree must never be rewritten, so conversion runs on a
+-  mirror-copy of the sources, made under the JIT cache root.
+-* Conversion also rewrites every transitively ``#include``d header it can
+-  discover, so the mirror has to cover the whole include closure, and the
+-  digest that keys the mirror has to cover it too — otherwise a header edit
+-  would be invisible to both the mirror and, transitively, the build cache.
+-
+-The mirror preserves each file's absolute path relative to ``/``, so relative
+-includes keep resolving inside it exactly as they did in the original tree.
+-"""
+-
+-from __future__ import annotations
+-
+-import hashlib
+-import logging
+-import os
+-import pathlib
+-import re
+-import shutil
+-import uuid
+-from typing import Dict, List, Optional, Set, Tuple
+-
+-from sglang.kernels.jit.utils.common import cache_once
+-from sglang.srt.environ import envs
+-
+-logger = logging.getLogger(__name__)
+-
+-# Mirrors sailify's `_RE_INCLUDE` / `DEFAULT_EXTENSIONS`: the closure below
+-# must contain exactly the files sailify itself would discover and convert.
+-_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]+[<"]([^>"]+)[>"]', re.MULTILINE)
+-_SOURCE_EXTENSIONS = (".cu", ".cuh", ".c", ".cc", ".cpp", ".h", ".hpp", ".inl")
+-
+-_KEY_HEX_LEN = 16
+-
+-
+-@cache_once
+-def sailify_version() -> str:
+-    """Installed sailify version, or 'unknown' (never raises)."""
+-    try:
+-        from importlib.metadata import version as dist_version
+-
+-        return dist_version("sailify")
+-    except Exception:
+-        pass
+-    try:
+-        from sailify.version import __version__
+-
+-        return str(__version__)
+-    except Exception:
+-        return "unknown"
+-
+-
+-@cache_once
+-def _ppu_sdk_version() -> str:
+-    """PPU SDK version as sailify detects it, or 'unknown' (never raises).
+-
+-    The SDK version is baked into the generated ``compatible_wrapper.h``, so
+-    it is part of the mirror digest.
+-    """
+-    try:
+-        from sailify.ppu_sdk_version import (
+-            detect_ppu_sdk_version,
+-            format_version_string,
+-        )
+-
+-        return format_version_string(detect_ppu_sdk_version())
+-    except Exception:
+-        return "unknown"
+-
+-
+-def _sailify_root() -> pathlib.Path:
+-    configured = envs.SGLANG_JIT_CACHE_DIR.get() or "~/.cache/sglang/jit"
+-    return pathlib.Path(configured).expanduser() / "sailified"
+-
+-
+-def _mirror_path(root: pathlib.Path, source: str) -> pathlib.Path:
+-    """The mirrored location of an absolute *source* path under *root*."""
+-    path = pathlib.Path(source)
+-    return root / path.relative_to(path.anchor)
+-
+-
+-def _discover_closure(
+-    cuda_files: List[str], include_dirs: List[str]
+-) -> Tuple[Set[str], Dict[str, Optional[str]]]:
+-    """Every file sailify would convert, with the base each resolved against.
+-
+-    Replicates sailify's own discovery: an include is tried against the
+-    including file's directory first, then each include dir in order; the
+-    first candidate that exists on disk wins, whether or not it is a source
+-    extension. The base is ``None`` for includes resolved against the
+-    including file's directory (the mirror reproduces those relative
+-    relationships on its own) and the include dir otherwise (whose mirrored
+-    location has to reach the compile line for the converted header to win
+-    over the original).
+-    """
+-    visited: Set[str] = set()
+-    bases: Dict[str, Optional[str]] = {}
+-    queue: List[str] = []
+-    for filepath in cuda_files:
+-        filepath = os.path.abspath(filepath)
+-        if filepath not in visited:
+-            visited.add(filepath)
+-            bases[filepath] = None
+-            queue.append(filepath)
+-
+-    while queue:
+-        filepath = queue.pop(0)
+-        try:
+-            source = pathlib.Path(filepath).read_text(errors="replace")
+-        except OSError:
+-            continue
+-        file_dir = os.path.dirname(filepath)
+-        for match in _INCLUDE_RE.finditer(source):
+-            inc = match.group(1)
+-            candidates = [(os.path.join(file_dir, inc), None)] + [
+-                (os.path.join(inc_dir, inc), os.path.abspath(inc_dir))
+-                for inc_dir in include_dirs
+-            ]
+-            for candidate, base in candidates:
+-                candidate = os.path.abspath(candidate)
+-                if candidate in visited:
+-                    break
+-                if os.path.isfile(candidate):
+-                    if os.path.splitext(candidate)[1] in _SOURCE_EXTENSIONS:
+-                        visited.add(candidate)
+-                        bases[candidate] = base
+-                        queue.append(candidate)
+-                    break
+-    return visited, bases
+-
+-
+-def _mirror_digest(closure: Set[str], include_dirs: List[str]) -> str:
+-    # Imported lazily: cache imports this module for the environment
+-    # fingerprint, so a top-level import would be circular.
+-    from sglang.kernels.jit.utils.compile import cache
+-
+-    digest = hashlib.sha256()
+-    for part in (sailify_version(), _ppu_sdk_version(), tuple(include_dirs)):
+-        digest.update(repr(part).encode())
+-        digest.update(b"\0")
+-    for path in sorted(closure):
+-        digest.update(path.encode())
+-        digest.update(b"\0")
+-        digest.update((cache._file_digest(pathlib.Path(path)) or "").encode())
+-        digest.update(b"\0")
+-    return digest.hexdigest()[:_KEY_HEX_LEN]
+-
+-
+-def convert_cuda_sources(
+-    cuda_files: List[str], include_dirs: List[str]
+-) -> Tuple[List[str], List[str]]:
+-    """Convert .cu sources with sailify into a content-addressed dir.
+-
+-    Returns (converted_cuda_files, extra_cuda_cflags) where extra flags add
+-    the mirrored include dirs, the generated .ppu_compat include dir, and a
+-    force-include of compatible_wrapper.h.
+-    """
+-    try:
+-        from sailify.sailify_python import sailify_extra_files_recursive
+-    except ImportError as error:
+-        raise RuntimeError(
+-            "JIT builds on SAIL require the sailify converter, which is not "
+-            "installed. Install it with `pip install -e cuda_free/sailify` from "
+-            "the sglang repository."
+-        ) from error
+-
+-    closure, bases = _discover_closure(cuda_files, include_dirs)
+-    outdir = _sailify_root() / _mirror_digest(closure, include_dirs)
+-    converted = [str(_mirror_path(outdir, os.path.abspath(f))) for f in cuda_files]
+-
+-    compat_header = outdir / ".ppu_compat" / "compatible_wrapper.h"
+-    if not (
+-        outdir.is_dir()
+-        and compat_header.is_file()
+-        and all(pathlib.Path(path).is_file() for path in converted)
+-    ):
+-        tmp = outdir.parent / f"{outdir.name}.tmp-{uuid.uuid4().hex}"
+-        try:
+-            mirror: Dict[str, str] = {}
+-            for source in sorted(closure):
+-                target = _mirror_path(tmp, source)
+-                target.parent.mkdir(parents=True, exist_ok=True)
+-                shutil.copy2(source, target)
+-                mirror[source] = str(target)
+-            sailify_extra_files_recursive(
+-                output_directory=str(tmp),
+-                extra_files=[mirror[source] for source in sorted(closure)],
+-                header_include_dirs=[],
+-            )
+-            outdir.parent.mkdir(parents=True, exist_ok=True)
+-            try:
+-                os.rename(tmp, outdir)
+-            except OSError:
+-                # A concurrent process published the identical content first.
+-                if not outdir.is_dir():
+-                    raise
+-        except Exception as error:
+-            raise RuntimeError(
+-                f"sailify failed to convert CUDA sources for hgcc: {error}"
+-            ) from error
+-        finally:
+-            shutil.rmtree(tmp, ignore_errors=True)
+-
+-    missing = [path for path in converted if not pathlib.Path(path).is_file()]
+-    if missing:
+-        raise RuntimeError(
+-            "sailify did not produce the expected converted sources: "
+-            + ", ".join(missing)
+-        )
+-    for source, path in zip(cuda_files, converted):
+-        src_ext = os.path.splitext(source)[1]
+-        out_ext = os.path.splitext(path)[1]
+-        assert src_ext == out_ext, (
+-            f"sailify changed the extension of {source}: converted to {path}"
+-        )
+-
+-    mirrored_include_dirs = [
+-        f"-I{_mirror_path(outdir, base)}"
+-        for base in dict.fromkeys(bases.values())
+-        if base is not None
+-    ]
+-    flags = mirrored_include_dirs + [
+-        f"-I{outdir / '.ppu_compat'}",
+-        "-include",
+-        "compatible_wrapper.h",
+-    ]
+-    return converted, flags
+diff --git a/python/sglang/kernels/jit/utils/compile/toolchain.py b/python/sglang/kernels/jit/utils/compile/toolchain.py
+index ffa3b65997..5c8752aa0b 100644
+--- a/python/sglang/kernels/jit/utils/compile/toolchain.py
++++ b/python/sglang/kernels/jit/utils/compile/toolchain.py
+@@ -22,22 +22,10 @@ from typing import List, Tuple
+ import torch
+ 
+ from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
+-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_sail_runtime
+-from sglang.srt.environ import envs
++from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
+ 
+ logger = logging.getLogger(__name__)
+ 
+-_SAIL_GPU_ARCHS = (
+-    "native",
+-    "all",
+-    "all-ppu",
+-    "all-vm",
+-    "ppu_10",
+-    "ppu_15",
+-    "vm_10",
+-    "vm_15",
+-)
+-
+ 
+ @cache_once
+ def cuda_home() -> str:
+@@ -76,59 +64,16 @@ def rocm_home() -> str:
+ 
+ @cache_once
+ def device_compiler_path() -> str:
+-    """The nvcc/hipcc/hgcc that JIT builds actually invoke.
++    """The nvcc/hipcc that JIT builds actually invoke.
+ 
+     Resolved the same way tvm-ffi resolves it, so the binary the cache
+     fingerprints is the binary that does the compiling.
+     """
+-    if is_sail_runtime():
+-        return hgcc_path()
+     if is_hip_runtime():
+         return os.path.join(rocm_home(), "bin", "hipcc")
+     return os.path.join(cuda_home(), "bin", "nvcc")
+ 
+ 
+-@cache_once
+-def hgcc_path() -> str:
+-    """The hgcc compiler, from PATH or the PPU SDK install."""
+-    searched = ["hgcc on PATH"]
+-    on_path = shutil.which("hgcc")
+-    if on_path is not None:
+-        return on_path
+-    for root in (
+-        os.environ.get("PPU_SDK"),
+-        os.environ.get("PPU_HOME"),
+-        "/usr/local/PPU_SDK",
+-    ):
+-        if root is None:
+-            continue
+-        candidate = os.path.join(root, "bin", "hgcc")
+-        searched.append(candidate)
+-        if os.path.isfile(candidate):
+-            return candidate
+-    raise RuntimeError(
+-        "JIT builds on SAIL require the hgcc compiler, which was not found. Searched: "
+-        + ", ".join(searched)
+-    )
+-
+-
+-@cache_once
+-def ppu_sdk_home() -> str:
+-    """The PPU SDK root providing the hggc libraries to link against.
+-
+-    Two layers live in ``lib/`` and they are not interchangeable:
+-    * ``libhggcrt1`` (SONAME ``libhggcrt.13.0.so``) is the *runtime*, the
+-      counterpart of cudart.  It alone exports the ``hggc*`` Runtime-API
+-      symbols and the ``__hggcRegister*`` entry points that hgcc's generated
+-      fat-binary registration code calls from every translation unit with
+-      device code.
+-    * ``libhggc`` is the *driver*, the counterpart of libcuda.  It exports the
+-      ``hg*`` Driver-API symbols (e.g. ``hgPointerGetAttribute``) and none of
+-      the ``hggc*`` ones.
+-    """
+-    return os.environ.get("PPU_SDK") or "/usr/local/PPU_SDK"
+-
+-
+ @cache_once
+ def host_compiler_path() -> str:
+     """The C++ compiler host code is handed to.
+@@ -184,14 +129,6 @@ def target_flags() -> List[str]:
+     the compiler driver to probe: the value is part of the cache key, so it has
+     to be decided here and not rediscovered at build time.
+     """
+-    if is_sail_runtime():
+-        arch = envs.SGLANG_SAIL_GPU_ARCH.get()
+-        if arch not in _SAIL_GPU_ARCHS:
+-            raise ValueError(
+-                f"Invalid SGLANG_SAIL_GPU_ARCH={arch!r}; expected one of "
+-                f"{', '.join(_SAIL_GPU_ARCHS)}"
+-            )
+-        return [f"--gpu-architecture={arch}"]
+     if is_hip_runtime():
+         return [f"--offload-arch={gpu_arch_name()}"]
+     arch = get_jit_cuda_arch()
+@@ -233,12 +170,6 @@ def base_link_flags(*, with_device: bool) -> List[str]:
+     flags = ["-shared", f"-L{lib_dir}", f"-l{lib_name}"]
+     if not with_device:
+         return flags
+-    if is_sail_runtime():
+-        return flags + [
+-            f"-L{ppu_sdk_home()}/lib",
+-            "-lhggcrt1",
+-            "-lhggc",
+-        ]
+     if is_hip_runtime():
+         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
+     return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 48698b98ba..175b2029e6 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1304,12 +1304,6 @@ class Envs:
+     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
+     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
+     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+-    # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
+-    # cannot read CUDA sources, so they are converted by sailify first).
+-    # One of: native, all, all-ppu,
+-    # all-vm, ppu_10, ppu_15, vm_10, vm_15. "native" builds for the local
+-    # device only, matching how the nvcc path pins -gencode to this GPU.
+-    SGLANG_SAIL_GPU_ARCH = EnvStr("native")
+ 
+     # ===================================================================
+     # Expert-parallel dispatch and MoE execution
+diff --git a/test/registered/unit/platforms/test_platform_interface.py b/test/registered/unit/platforms/test_platform_interface.py
+index ef9cc46ff3..35249d37ba 100644
+--- a/test/registered/unit/platforms/test_platform_interface.py
++++ b/test/registered/unit/platforms/test_platform_interface.py
+@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
+ import torch
+ 
+ from sglang import _platform_stubs
+-from sglang.kernels.jit.utils.arch import _sail_arch_suffix
+ from sglang.srt.platforms import _load_platform_class, _resolve_platform, interface
+ from sglang.srt.platforms.cpu import CpuSRTPlatform
+ from sglang.srt.platforms.cuda import CudaSRTPlatform
+@@ -24,7 +23,6 @@ from sglang.srt.platforms.interface import SRTPlatform
+ from sglang.srt.platforms.mps import MpsSRTPlatform
+ from sglang.srt.platforms.npu import NPUSRTPlatform
+ from sglang.srt.platforms.rocm import RocmSRTPlatform
+-from sglang.srt.platforms.sail import SailSRTPlatform
+ from sglang.srt.platforms.xpu import XpuSRTPlatform
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+@@ -235,47 +233,6 @@ class TestCudaDeviceMixin(CustomTestCase):
+         mock_cuda_seed.assert_called_once_with(123)
+ 
+ 
+-class TestSailDeviceMixin(CustomTestCase):
+-    """Tests for SAIL device operation defaults (CUDA-compatible surface)."""
+-
+-    def test_sail_identity_overrides_cuda_identity(self):
+-        base = SailSRTPlatform()
+-        self.assertEqual(base._enum, PlatformEnum.SAIL)
+-        self.assertEqual(base.device_name, "sail")
+-        # device_type stays "cuda" — torch.device("cuda") is the only valid
+-        # device-type string for SAIL devices in PyTorch.
+-        self.assertEqual(base.device_type, "cuda")
+-        # SAIL overrides is_cuda() to True: it exposes CUDA-compatible APIs.
+-        self.assertTrue(base.is_cuda())
+-        self.assertTrue(base.is_sail())
+-        self.assertTrue(base.is_cuda_alike())
+-
+-    def test_sail_srt_platform_capabilities(self):
+-        base = SailSRTPlatform()
+-        self.assertTrue(base.support_cuda_graph())
+-        self.assertTrue(base.support_piecewise_cuda_graph())
+-
+-    @patch("torch.cuda.get_device_capability", return_value=(8, 9))
+-    def test_sail_supports_fp8_at_sm89(self, mock_get_device_capability):
+-        base = SailSRTPlatform()
+-        self.assertTrue(base.supports_fp8())
+-
+-    @patch("torch.cuda.get_device_capability", return_value=(8, 0))
+-    def test_sail_supports_fp8_below_sm89(self, mock_get_device_capability):
+-        base = SailSRTPlatform()
+-        self.assertFalse(base.supports_fp8())
+-
+-    def test_sail_arch_suffix_below_sm89(self):
+-        # SAIL devices below the SM89 capability require the arch-specific
+-        # target variant for JIT compilation.
+-        self.assertEqual(_sail_arch_suffix(8, 0), "a")
+-        self.assertEqual(_sail_arch_suffix(8, 8), "a")
+-
+-    def test_sail_arch_suffix_sm89_and_above(self):
+-        self.assertEqual(_sail_arch_suffix(8, 9), "")
+-        self.assertEqual(_sail_arch_suffix(9, 0), "")
+-
+-
+ class TestXpuDeviceMixin(CustomTestCase):
+     """Tests for XPU device operation defaults."""
+ 
+-- 
+2.43.7
+
+
+From 7986ff5f5a0662208fd91c84dc4dd0a88f3a803b Mon Sep 17 00:00:00 2001
+From: "billding.df" <billding.df@alibaba-inc.com>
+Date: Thu, 22 Oct 2026 15:50:20 +0800
+Subject: [PATCH 2/3] feat(build): add CUDA-compatible SAIL platform JIT
+ support
+
+Re-add the SAIL-specific JIT compilation hooks on top of the preserved
+platform detection layer, following the upstream PPU platform pattern:
+
+- SRTPlatform.get_jit_cuda_arch_suffix() hook with a safe "" default for
+  every platform
+- SailSRTPlatform overrides it: device names containing "810" (810/810e,
+  e.g. ZW810E) require the "sm80a" JIT arch variant
+- JIT arch detection consults current_platform on SAIL instead of the
+  removed capability-based _sail_arch_suffix helper
+- Unit tests for SAIL platform identity, capabilities and the arch-suffix
+  hook
+
+The platform detection layer (PlatformEnum.SAIL, is_sail(),
+is_sail_runtime(), SailSRTPlatform discovery fallback) is reused as-is.
+---
+ python/sglang/kernels/jit/utils/arch.py       | 14 +++---
+ python/sglang/srt/platforms/interface.py      | 13 ++++++
+ python/sglang/srt/platforms/sail.py           |  5 +++
+ .../unit/platforms/test_platform_interface.py | 44 +++++++++++++++++++
+ 4 files changed, 71 insertions(+), 5 deletions(-)
+
+diff --git a/python/sglang/kernels/jit/utils/arch.py b/python/sglang/kernels/jit/utils/arch.py
+index 38cdc67add..a0d39381be 100644
+--- a/python/sglang/kernels/jit/utils/arch.py
++++ b/python/sglang/kernels/jit/utils/arch.py
+@@ -105,11 +105,15 @@ def _init_jit_cuda_arch_once():
+     # JIT builds target the exact local GPU, so the arch-specific target is
+     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
+     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.
+-    suffix = (
+-        ""
+-        if (is_hip_runtime() or is_musa_runtime())
+-        else _cuda_arch_suffix(major, minor)
+-    )
++    if is_hip_runtime() or is_musa_runtime():
++        suffix = ""
++    elif is_sail_runtime():
++        from sglang.srt.platforms import current_platform
++
++        suffix = current_platform.get_jit_cuda_arch_suffix()
++    else:
++        suffix = _cuda_arch_suffix(major, minor)
++
+     _CUDA_ARCH = ArchInfo(major, minor, suffix)
+ 
+ 
+diff --git a/python/sglang/srt/platforms/interface.py b/python/sglang/srt/platforms/interface.py
+index 70fc60d1ef..c71f520953 100644
+--- a/python/sglang/srt/platforms/interface.py
++++ b/python/sglang/srt/platforms/interface.py
+@@ -190,6 +190,19 @@ class SRTPlatform(DeviceMixin):
+         to use the default config."""
+         return None
+ 
++    # ------------------------------------------------------------------
++    # JIT compilation hooks
++    # ------------------------------------------------------------------
++
++    def get_jit_cuda_arch_suffix(self) -> str:
++        """Return an optional suffix appended to the CUDA arch string during JIT
++        compilation (e.g. ``"a"`` yields ``"sm80a"`` instead of ``"sm80"``).
++
++        Most platforms return ``""`` (no suffix).  Override for hardware that
++        requires a non-standard arch variant identifier.
++        """
++        return ""
++
+     # ------------------------------------------------------------------
+     # Speculative decoding support (safe conservative defaults)
+     # ------------------------------------------------------------------
+diff --git a/python/sglang/srt/platforms/sail.py b/python/sglang/srt/platforms/sail.py
+index 7e1604927f..e1b8252ce6 100644
+--- a/python/sglang/srt/platforms/sail.py
++++ b/python/sglang/srt/platforms/sail.py
+@@ -18,6 +18,7 @@ from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+ 
+ _ZW_TAG = "ZW"
+ _ZW810E_NAME = "ZW810E"
++_810_TAG = "810"
+ 
+ 
+ @lru_cache(maxsize=1)
+@@ -52,6 +53,10 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
+         piecewise_graph=True,
+     )
+ 
++    def get_jit_cuda_arch_suffix(self) -> str:
++        # SAIL 810/810e devices require the "sm80a" arch variant for JIT compilation.
++        return "a" if _810_TAG in self.get_device_name() else ""
++
+     def is_zw810e(self) -> bool:
+         return _ZW810E_NAME in self.get_device_name()
+ 
+diff --git a/test/registered/unit/platforms/test_platform_interface.py b/test/registered/unit/platforms/test_platform_interface.py
+index 35249d37ba..d14ff6080a 100644
+--- a/test/registered/unit/platforms/test_platform_interface.py
++++ b/test/registered/unit/platforms/test_platform_interface.py
+@@ -23,6 +23,7 @@ from sglang.srt.platforms.interface import SRTPlatform
+ from sglang.srt.platforms.mps import MpsSRTPlatform
+ from sglang.srt.platforms.npu import NPUSRTPlatform
+ from sglang.srt.platforms.rocm import RocmSRTPlatform
++from sglang.srt.platforms.sail import SailSRTPlatform
+ from sglang.srt.platforms.xpu import XpuSRTPlatform
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+@@ -233,6 +234,49 @@ class TestCudaDeviceMixin(CustomTestCase):
+         mock_cuda_seed.assert_called_once_with(123)
+ 
+ 
++class TestSailDeviceMixin(CustomTestCase):
++    """Tests for SAIL device operation defaults (CUDA-compatible surface)."""
++
++    def test_sail_identity_overrides_cuda_identity(self):
++        base = SailSRTPlatform()
++        self.assertEqual(base._enum, PlatformEnum.SAIL)
++        self.assertEqual(base.device_name, "sail")
++        # device_type stays "cuda" — torch.device("cuda") is the only valid
++        # device-type string for SAIL devices in PyTorch.
++        self.assertEqual(base.device_type, "cuda")
++        # SAIL overrides is_cuda() to True: it exposes CUDA-compatible APIs.
++        self.assertTrue(base.is_cuda())
++        self.assertTrue(base.is_sail())
++        self.assertTrue(base.is_cuda_alike())
++
++    def test_sail_srt_platform_capabilities(self):
++        base = SailSRTPlatform()
++        self.assertTrue(base.support_cuda_graph())
++        self.assertTrue(base.support_piecewise_cuda_graph())
++
++    @patch("torch.cuda.get_device_capability", return_value=(8, 9))
++    def test_sail_supports_fp8_at_sm89(self, mock_get_device_capability):
++        base = SailSRTPlatform()
++        self.assertTrue(base.supports_fp8())
++
++    @patch("torch.cuda.get_device_capability", return_value=(8, 0))
++    def test_sail_supports_fp8_below_sm89(self, mock_get_device_capability):
++        base = SailSRTPlatform()
++        self.assertFalse(base.supports_fp8())
++
++    @patch("torch.cuda.get_device_name", return_value="ZW810E")
++    def test_get_jit_cuda_arch_suffix_810_devices(self, mock_get_device_name):
++        # SAIL 810/810e devices require the "sm80a" arch variant for JIT
++        # compilation.
++        base = SailSRTPlatform()
++        self.assertEqual(base.get_jit_cuda_arch_suffix(), "a")
++
++    @patch("torch.cuda.get_device_name", return_value="SAIL 2900")
++    def test_get_jit_cuda_arch_suffix_non_810_devices(self, mock_get_device_name):
++        base = SailSRTPlatform()
++        self.assertEqual(base.get_jit_cuda_arch_suffix(), "")
++
++
+ class TestXpuDeviceMixin(CustomTestCase):
+     """Tests for XPU device operation defaults."""
+ 
+-- 
+2.43.7
+
+
+From 65db2f724cf7a787a42f0516a4cb9d8ce918b192 Mon Sep 17 00:00:00 2001
+From: "billding.df" <billding.df@alibaba-inc.com>
+Date: Thu, 22 Oct 2026 15:50:34 +0800
+Subject: [PATCH 3/3] feat(build): add nvcc-based setup_sail.py for
+ CUDA-compatible SAIL kernel build
+
+Provide a working sgl-kernel source build for the SAIL/PPU platform now
+that the hgcc/sailify stack is gone. On a SAIL host nvcc is the PPU SDK's
+CUDA-compatible driver (reads .cu directly, accepts -gencode, and the SDK
+ships real libcudart/libcublas/libcublasLt/libcuda), so the kernel builds
+through the standard torch CUDAExtension path -- no source translation.
+
+- setup_sail.py: CUDAExtension + nvcc, gencode pinned to sm_80 (ZW810E is
+  capability 8.0), real CUDA libs (c10/cuda/cublas/cublasLt), third-party
+  actlize/flashinfer/triton clone, sources relativized to satisfy
+  setuptools assert_relative. No torch pin in setup() deps.
+- The build compiles the SM80 op surface registered by the existing
+  csrc/common_extension_sail.cc; SM90+/CUTLASS ops stay trimmed and are
+  served by PPU-native backends at runtime.
+- sail.mdx: document the wheel + 'pip install --no-deps' flow so the
+  pyproject.toml torch pin cannot clobber the PPU-customized torch.
+---
+ docs/docs/hardware-platforms/sail.mdx   |  65 +++--
+ python/sglang/kernels/aot/setup_sail.py | 358 ++++++++++++++++++++++++
+ 2 files changed, 397 insertions(+), 26 deletions(-)
+ create mode 100644 python/sglang/kernels/aot/setup_sail.py
+
+diff --git a/docs/docs/hardware-platforms/sail.mdx b/docs/docs/hardware-platforms/sail.mdx
+index 5e223b5af5..2396c0ddee 100644
+--- a/docs/docs/hardware-platforms/sail.mdx
++++ b/docs/docs/hardware-platforms/sail.mdx
+@@ -1,53 +1,66 @@
+ ---
+-title: "T-HEAD SAILs"
++title: "T-HEAD SAIL Platform"
+ metatags:
+-    description: "Run SGLang on T-HEAD SAILs."
++    description: "Run SGLang on T-HEAD SAIL devices."
+ ---
+ 
+-This document describes how to run SGLang on T-HEAD SAILs. If you
+-encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
++This document describes how to run SGLang on T-HEAD SAILs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
++
++SAIL exposes a CUDA-compatible API through its torch backend, so SGLang runs on
++SAIL through the standard CUDA platform path — no separate toolchain or kernel
++source conversion is required.
+ 
+ ## Prerequisites
+ 
+-Install the T-HEAD SAIL driver and the PPU SDK before installing SGLang, and export
+-the `PPU_SDK` environment variable pointing at the SDK installation (for
+-example, `/usr/local/PPU_SDK`). The Triton SAIL backend requires this variable
+-when compiling kernels at runtime.
++Install the T-HEAD SAIL driver and a CUDA-compatible SAIL torch build before
++installing SGLang.
+ 
+ Verify that the device is visible:
+ 
+-```bash Command
++```bash
+ python3 -c 'import torch; print(torch.cuda.get_device_name())'
+ # Expected: a ZW-series device, e.g. "ZW810E"
+ ```
+ 
+ ## Install SGLang
+ 
+-### Install from Source
++You can install SGLang using one of the methods below.
+ 
+-Start from an environment with the prerequisites above installed.
++### Install from Source
+ 
+-```bash Command
++```bash
++# Use the default branch
+ git clone https://github.com/sgl-project/sglang.git
+ cd sglang
+ 
+-python -m pip install --upgrade pip wheel
+-
+-cp python/pyproject_other.toml python/pyproject.toml
+-python -m pip install -e "python[all_sail]" \
+-  --no-build-isolation
+-
+-# Install sailify
+-python -m pip install sailify
+-
+-# Build sgl-kernel for SAIL from source
++# Compile sgl-kernel for SAIL (nvcc/CUDAExtension, sm80 op surface).
++# Build a wheel and install it with --no-deps: the in-tree pyproject.toml
++# pins torch==2.14.1, and a dependency-resolving install would overwrite
++# the SAIL/PPU-customized torch.
++pip install --upgrade pip
+ cd python/sglang/kernels/aot
+-python setup_sail.py install
++python setup_sail.py bdist_wheel
++pip install --no-deps --force-reinstall dist/sglang_kernel-*.whl
++
++# Install the sglang python package.
++# Use --no-build-isolation and protect the preinstalled SAIL torch.
++cd ../../../..
++pip install -e python --no-build-isolation --no-deps
+ ```
+ 
++<Note>
++  `setup_sail.py` targets the SAIL nvcc (the PPU SDK's CUDA-compatible
++  compiler driver) and registers only the SM80 op surface via
++  `csrc/common_extension_sail.cc`. The SM90+/CUTLASS kernels are excluded —
++  they do not target ZW810E and are served by PPU-native backends at
++  runtime. Third-party deps (actlize, flashinfer, triton) are cloned
++  automatically; set `SGL_KERNEL_SKIP_THIRD_PARTY=1` to reuse an existing
++  `build/_deps` checkout.
++</Note>
++
+ Launch the server:
+ 
+-```bash Command
++```bash
+ python3 -m sglang.launch_server \
+   --model-path Qwen/Qwen3-8B \
+   --host 0.0.0.0 \
+@@ -61,7 +74,7 @@ successful.
+ 
+ You can send an OpenAI-compatible request to the engine:
+ 
+-```bash Command
++```bash
+ curl http://127.0.0.1:30000/v1/chat/completions \
+   -H "Content-Type: application/json" \
+   -d '{
+@@ -73,7 +86,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
+ 
+ Or run a benchmark:
+ 
+-```bash Command
++```bash
+ python3 -m sglang.bench_serving \
+   --backend sglang \
+   --dataset-name random \
+diff --git a/python/sglang/kernels/aot/setup_sail.py b/python/sglang/kernels/aot/setup_sail.py
+new file mode 100644
+index 0000000000..e292036d41
+--- /dev/null
++++ b/python/sglang/kernels/aot/setup_sail.py
+@@ -0,0 +1,358 @@
++# Copyright 2025 SGLang Team. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""sgl-kernel build script for the T-HEAD SAIL (PPU) platform.
++
++SAIL exposes a CUDA-compatible toolchain: ``nvcc`` on a SAIL host is the PPU
++SDK's CUDA compiler driver -- it reads ``.cu`` sources directly and accepts
++standard ``-gencode=arch=compute_80,code=sm_80`` targets, and the SDK ships
++real ``libcudart``/``libcublas``/``libcublasLt``/``libcuda``.  This build
++therefore mirrors the upstream CUDA ``CUDAExtension`` path (no source
++translation, no separate device compiler).
++
++Only the SM80 op surface is registered (``csrc/common_extension_sail.cc``):
++the SM90+/CUTLASS kernels trimmed from it do not target the ZW810E (capability
++8.0) and are dispatched through PPU-native backends at runtime instead.  The
++trimmed op wrappers in ``python/sgl_kernel`` resolve ``torch.ops`` lazily, so
++``import sgl_kernel`` stays valid on a trimmed build.
++
++Environment overrides:
++  SGL_KERNEL_THIRD_PARTY_DIR   where to clone/find actlize, flashinfer, triton
++  SGL_KERNEL_ACTLIZE_DIR       pre-existing actlize checkout
++  SGL_KERNEL_SKIP_THIRD_PARTY  "1" to skip cloning third-party repos
++  SGL_KERNEL_CUDA_GENCODE      override the default sm80 gencode target(s)
++  SGL_KERNEL_ENABLE_BF16/FP8   toggle flashinfer bf16/fp8 defines (default on)
++  SGL_KERNEL_COMPILE_THREADS   nvcc --threads (default 32)
++
++Build from this directory so the relative source paths resolve. Use the
++wheel + ``pip install --no-deps`` flow, NOT ``python setup_sail.py install``:
++the in-tree ``pyproject.toml`` statically pins ``torch==2.14.1``, and the
++``install`` command's easy_install step would resolve that pin and overwrite
++the PPU-customized torch. ``--no-deps`` keeps the installed torch untouched.
++
++  cd python/sglang/kernels/aot
++  python setup_sail.py bdist_wheel
++  pip install --no-deps --force-reinstall dist/sglang_kernel-*.whl
++"""
++
++import os
++import platform
++import re
++import subprocess
++from pathlib import Path
++
++import torch
++from setuptools import find_namespace_packages, setup
++from torch.utils.cpp_extension import BuildExtension, CUDAExtension
++
++root = Path(__file__).parent.resolve()
++third_party = Path(
++    os.environ.get("SGL_KERNEL_THIRD_PARTY_DIR", root / "build" / "_deps")
++)
++arch = platform.machine().lower()
++
++# ======================= CUDA Version Detection ======================= #
++cuda_version = torch.version.cuda
++if cuda_version is None:
++    raise RuntimeError("CUDA is not available in the current PyTorch installation.")
++
++cuda_version_tuple = tuple(int(x) for x in cuda_version.split(".")[:2])
++print(f"Detected CUDA version: {cuda_version} ({cuda_version_tuple})")
++
++
++# ======================= Third-Party Repository Info ======================= #
++class _RepoInfo:
++    """Configuration for a third-party git repository."""
++
++    def __init__(self, name, git_repository, git_tag, git_shallow=False):
++        self.name = name
++        self.git_repository = git_repository
++        self.git_tag = git_tag
++        self.git_shallow = git_shallow
++        self.source_dir = third_party / name
++
++
++_ACTLIZE_REPO = _RepoInfo(
++    name="actlize",
++    git_repository="https://github.com/NVIDIA/cutlass",
++    git_tag="57e3cfb47a2d9e0d46eb6335c3dc411498efa198",
++    git_shallow=False,
++)
++
++_ACTLIZE_DIR = Path(os.environ.get("SGL_KERNEL_ACTLIZE_DIR", _ACTLIZE_REPO.source_dir))
++
++_FLASHINFER_REPO = _RepoInfo(
++    name="flashinfer",
++    git_repository="https://github.com/flashinfer-ai/flashinfer.git",
++    git_tag="bc29697ba20b7e6bdb728ded98f04788e16ee021",
++    git_shallow=False,
++)
++
++_TRITON_REPO = _RepoInfo(
++    name="triton",
++    git_repository="https://github.com/triton-lang/triton",
++    git_tag="v3.7.0",
++    git_shallow=False,
++)
++
++ALL_REPOS = [
++    _ACTLIZE_REPO,
++    _FLASHINFER_REPO,
++    _TRITON_REPO,
++]
++
++
++# ======================= Version ======================= #
++def _get_version():
++    # Reuse the version declared by the in-tree pyproject.toml so the SAIL
++    # wheel tracks the same sglang-kernel version as the CUDA build.
++    with open(root / "pyproject.toml") as f:
++        for line in f:
++            m = re.match(r'^version\s*=\s*"([^"]+)"', line)
++            if m:
++                return m.group(1)
++    return "0.0.0"
++
++
++# ======================= Build Configuration ======================= #
++operator_namespace = "sgl-kernel"
++
++# Determine CXX ABI compatibility with PyTorch
++torch_cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
++abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}"
++
++enable_bf16 = os.environ.get("SGL_KERNEL_ENABLE_BF16", "1").lower() in (
++    "1",
++    "true",
++    "on",
++    "yes",
++)
++enable_fp8 = os.environ.get("SGL_KERNEL_ENABLE_FP8", "1").lower() in (
++    "1",
++    "true",
++    "on",
++    "yes",
++)
++compile_threads = int(os.environ.get("SGL_KERNEL_COMPILE_THREADS", "32"))
++if compile_threads < 1:
++    compile_threads = 1
++
++# ======================= NVCC Flags ======================= #
++# The SAIL nvcc accepts standard CUDA gencode targets. ZW810E is capability
++# (8, 0), so the default fatbin targets sm_80 only; override via
++# SGL_KERNEL_CUDA_GENCODE (space-separated) for other SAIL parts.
++_default_gencode = "-gencode=arch=compute_80,code=sm_80"
++_gencode_flags = os.environ.get("SGL_KERNEL_CUDA_GENCODE", _default_gencode).split()
++
++sgl_kernel_cuda_flags = [
++    "-DNDEBUG",
++    f"-DOPERATOR_NAMESPACE={operator_namespace}",
++    "-O3",
++    "-Xcompiler",
++    "-fPIC",
++    *_gencode_flags,
++    "-std=c++17",
++    "-DFLASHINFER_ENABLE_F16",
++    "-DCUTE_USE_PACKED_TUPLE=1",
++    "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
++    "-DCUTLASS_VERSIONS_GENERATED",
++    "-DCUTLASS_TEST_LEVEL=0",
++    "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1",
++    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
++    "--expt-relaxed-constexpr",
++    "--expt-extended-lambda",
++    "-U__CUDA_NO_HALF_OPERATORS__",
++    "-U__CUDA_NO_HALF_CONVERSIONS__",
++    "-U__CUDA_NO_HALF2_OPERATORS__",
++    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
++    f"--threads={compile_threads}",
++    # Suppress warnings
++    "-Xcompiler=-Wno-clang-format-violations",
++    "-Xcompiler=-Wno-conversion",
++    "-Xcompiler=-Wno-deprecated-declarations",
++    "-Xcompiler=-Wno-terminate",
++    "-Xcompiler=-Wfatal-errors",
++    "-Xcompiler=-ftemplate-backtrace-limit=1",
++    "-Xcudafe=--diag_suppress=177",
++    "-Xcudafe=--diag_suppress=2361",
++    f"-Xcompiler={abi_flag}",
++    abi_flag,
++]
++
++if enable_bf16:
++    sgl_kernel_cuda_flags.append("-DFLASHINFER_ENABLE_BF16")
++
++if enable_fp8:
++    sgl_kernel_cuda_flags.extend(
++        [
++            "-DFLASHINFER_ENABLE_FP8",
++            "-DFLASHINFER_ENABLE_FP8_E4M3",
++            "-DFLASHINFER_ENABLE_FP8_E5M2",
++        ]
++    )
++
++# ======================= Include Directories ======================= #
++include_dirs = [
++    str(root / "include"),
++    str(root / "csrc"),
++    # Speculative device kernels are shared with the JIT launchers.
++    str(root.parent / "jit" / "include"),
++    str(_ACTLIZE_DIR / "include"),
++    str(_ACTLIZE_DIR / "tools" / "util" / "include"),
++    str(_FLASHINFER_REPO.source_dir / "include"),
++    str(_FLASHINFER_REPO.source_dir / "csrc"),
++    str(_ACTLIZE_DIR / "examples" / "77_blackwell_fmha"),
++    str(_ACTLIZE_DIR / "examples" / "common"),
++]
++
++# ======================= Source Files ======================= #
++# SM80 op surface only -- matches csrc/common_extension_sail.cc. The
++# SM90+/CUTLASS kernels (fp8/int8 scaled_mm, cutlass_w4a8_moe, es_sm100_*,
++# dsv4_fused_*, infllm_v2_*) are intentionally excluded; they do not target
++# ZW810E and are served by PPU-native backends at runtime.
++common_sources = [
++    "csrc/allreduce/custom_all_reduce.cu",
++    "csrc/attention/merge_attn_states.cu",
++    "csrc/common_extension_sail.cc",
++    "csrc/elementwise/activation.cu",
++    "csrc/elementwise/concat_mla.cu",
++    "csrc/elementwise/copy.cu",
++    "csrc/elementwise/fused_add_rms_norm_kernel.cu",
++    "csrc/elementwise/pos_enc.cu",
++    "csrc/elementwise/topk.cu",
++    "csrc/gemm/per_token_group_quant_8bit.cu",
++    "csrc/gemm/per_token_group_quant_8bit_v2.cu",
++    "csrc/gemm/per_token_quant_fp8.cu",
++    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
++    "csrc/kvcacheio/transfer.cu",
++    "csrc/mamba/causal_conv1d.cu",
++    "csrc/memory/weak_ref_tensor.cpp",
++    "csrc/moe/moe_align_kernel.cu",
++    "csrc/moe/fused_qknorm_rope_kernel.cu",
++    "csrc/moe/moe_sum.cu",
++    "csrc/moe/moe_sum_reduce.cu",
++    "csrc/moe/moe_topk_softmax_kernels.cu",
++    "csrc/moe/moe_topk_sigmoid_kernels.cu",
++    "csrc/moe/prepare_moe_input.cu",
++    "csrc/quantization/gguf/gguf_kernel.cu",
++]
++
++# Third-party source files.
++flashinfer_sources = [
++    str(_FLASHINFER_REPO.source_dir / "csrc" / "norm.cu"),
++    str(_FLASHINFER_REPO.source_dir / "csrc" / "renorm.cu"),
++]
++
++# setuptools rejects absolute source paths (build_py.analyze_manifest calls
++# assert_relative on every entry written to SOURCES.txt). Relativize against
++# `root` and always build from this directory so the paths resolve.
++all_common_sources = [
++    s if not os.path.isabs(s) else os.path.relpath(s, root)
++    for s in common_sources + flashinfer_sources
++]
++
++# The SAIL PPU SDK ships real CUDA runtime/BLAS libraries, so link the
++# standard CUDA spellings (matching the upstream CUDA build).
++libraries = ["c10", "cuda", "cublas", "cublasLt"]
++extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
++
++
++# ======================= Extension Modules ======================= #
++def _make_common_ops():
++    """common_ops for SM80."""
++    nvcc_flags = sgl_kernel_cuda_flags + ["-use_fast_math"]
++    return CUDAExtension(
++        name="sgl_kernel.common_ops",
++        sources=all_common_sources,
++        include_dirs=include_dirs,
++        extra_compile_args={
++            "nvcc": nvcc_flags,
++            "cxx": ["-O3", "-std=c++17", abi_flag],
++        },
++        libraries=libraries,
++        extra_link_args=extra_link_args,
++        py_limited_api=False,
++    )
++
++
++# ======================= Clone Third-Party Repositories ======================= #
++def _clone_and_checkout(repo_path, repo_url, git_tag, git_shallow):
++    """Clone a git repository and checkout a specific tag/commit."""
++    repo_path = Path(repo_path)
++    repo_path.parent.mkdir(parents=True, exist_ok=True)
++    if not repo_path.exists():
++        clone_cmd = ["git", "clone"]
++        if git_shallow:
++            clone_cmd += ["--depth", "1"]
++        clone_cmd += [repo_url, str(repo_path)]
++        print(f"Cloning {repo_url} -> {repo_path}")
++        subprocess.check_call(clone_cmd)
++        subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
++
++
++if os.environ.get("SGL_KERNEL_SKIP_THIRD_PARTY", "0") != "1":
++    for _repo in ALL_REPOS:
++        _clone_and_checkout(
++            _repo.source_dir,
++            _repo.git_repository,
++            _repo.git_tag,
++            _repo.git_shallow,
++        )
++
++
++# ======================= Build Extension Modules List ======================= #
++ext_modules = [
++    _make_common_ops(),
++]
++
++
++# ======================= Custom Build Extension ======================= #
++class _CustomBuildExt(BuildExtension):
++    """Custom build extension with ninja support."""
++
++    pass
++
++
++# ======================= Package Discovery ======================= #
++_triton_kernels_root = _TRITON_REPO.source_dir / "python" / "triton_kernels"
++
++_packages = find_namespace_packages(where="python")
++_package_dir = {"": "python"}
++
++# Discover triton_kernels packages (may not exist before first clone)
++if _triton_kernels_root.exists():
++    _triton_pkgs = find_namespace_packages(
++        where=str(_triton_kernels_root),
++        exclude=["tests", "tests.*"],
++    )
++else:
++    _triton_pkgs = ["triton_kernels"]
++
++for pkg in _triton_pkgs:
++    _package_dir[pkg] = os.path.relpath(
++        _triton_kernels_root / pkg.replace(".", os.sep), root
++    )
++_packages += _triton_pkgs
++
++
++# ======================= Setup ======================= #
++setup(
++    name="sglang-kernel",
++    version=_get_version(),
++    packages=_packages,
++    package_dir=_package_dir,
++    ext_modules=ext_modules,
++    cmdclass={"build_ext": _CustomBuildExt.with_options(use_ninja=True)},
++    options={"bdist_wheel": {"py_limited_api": "cp310"}},
++)
+-- 
+2.43.7
+
+
