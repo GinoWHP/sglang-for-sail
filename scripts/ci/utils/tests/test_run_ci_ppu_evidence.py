@@ -574,6 +574,147 @@ class CpuShortlistContractTest(unittest.TestCase):
         self.assertEqual(cpu | runtime, original)
 
 
+class LegacyAdapterImportContractTest(unittest.TestCase):
+    def setUp(self):
+        from _pytest.pathlib import ImportMode, import_path
+
+        self.enterContext(patch.dict(sys.modules))
+        self.enterContext(patch.object(sys, "path", sys.path.copy()))
+        for name in tuple(sys.modules):
+            if name == "ppu" or name.startswith(("ppu.", "_ppu_pr_legacy_")):
+                sys.modules.pop(name)
+        conftest = import_path(
+            ROOT / "test/registered/ppu/conftest.py",
+            mode=ImportMode.prepend,
+            root=ROOT,
+            consider_namespace_packages=False,
+        )
+        self.assertEqual(conftest.__name__, "ppu.conftest")
+        self.assertEqual(
+            Path(sys.modules["ppu"].__file__),
+            ROOT / "test/registered/ppu/__init__.py",
+        )
+        self.helper = sys.modules["ppu"]
+        self.assertIsNone(importlib.util.find_spec("ppu.unit"))
+
+    def test_real_dsa_tests_load_and_execute_despite_shadowed_package(self):
+        relative = "unit/test_dsa_prefill_graph_int8.py"
+        module = self.helper.load_legacy_ppu_module(relative)
+        self.assertEqual(Path(module.__file__), ROOT / "test/ppu" / relative)
+        self.assertIs(sys.modules[module.__name__], module)
+        self.assertIs(self.helper.load_legacy_ppu_module(relative), module)
+        suite = unittest.TestLoader().loadTestsFromTestCase(
+            module.TestDsaPrefillGraphInt8
+        )
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertTrue(result.wasSuccessful(), (result.errors, result.failures))
+        self.assertEqual(result.testsRun, 3)
+        self.assertEqual(result.skipped, [])
+
+    def test_adapter_paths_and_exports_keep_original_objects(self):
+        from importlib.machinery import SourceFileLoader
+
+        inventory = {
+            "test_cpu_dispatch.py": {
+                "unit/test_deepseek_v4_dspark_quant_metadata.py": (
+                    "TestDequantSupported",
+                    "TestDsparkV4QuantMetadata",
+                    "TestFusedCommitKvProjSupport",
+                ),
+                "unit/test_dsa_prefill_graph_int8.py": ("TestDsaPrefillGraphInt8",),
+            },
+            "test_cpu_pool_hooks.py": {
+                "module/test_ppu_deepep_hooks.py": ("TestPPUDeepEPHooks",),
+                "test_kda_replayssm_pool.py": ("test_replayssm_pool_and_budget",),
+            },
+            "test_kernels.py": {
+                "unit/test_topk_prefill_bf16_alignment.py": ("test_topk_alignment",),
+            },
+        }
+        original_exec = SourceFileLoader.exec_module
+        for adapter, sources in inventory.items():
+            with self.subTest(adapter=adapter):
+                expected = {
+                    ROOT / "test/ppu" / path: names for path, names in sources.items()
+                }
+                seen, exports = set(), {}
+
+                def record_source(loader, module):
+                    source = Path(module.__file__)
+                    if source not in expected:
+                        return original_exec(loader, module)
+                    self.assertIs(sys.modules[module.__name__], module)
+                    seen.add(source)
+                    definitions = {
+                        node.name
+                        for node in ast.parse(source.read_text()).body
+                        if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                    }
+                    for name in expected[source]:
+                        self.assertIn(name, definitions)
+                        exports[name] = object()
+                        setattr(module, name, exports[name])
+
+                path = ROOT / "test/registered/ppu/pr" / adapter
+                bootstrap = []
+                for node in ast.parse(path.read_text()).body:
+                    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                        call = ast.unparse(node.value.func)
+                        if call == "register_ppu_ci":
+                            break
+                        if call == "sys.path.insert":
+                            bootstrap.append(node)
+                            continue
+                    if bootstrap:
+                        bootstrap.append(node)
+                self.assertTrue(bootstrap)
+                namespace = {"sys": sys, "Path": Path, "__file__": str(path)}
+                # Only intercept the SDK-dependent source execution boundary;
+                # exercise the real adapter bootstrap and path-based loader.
+                with patch.object(SourceFileLoader, "exec_module", record_source):
+                    exec(
+                        compile(
+                            ast.Module(body=bootstrap, type_ignores=[]),
+                            str(path),
+                            "exec",
+                        ),
+                        namespace,
+                    )
+                self.assertEqual(seen, set(expected))
+                for name, value in exports.items():
+                    self.assertIs(namespace[name], value)
+                self.assertEqual(
+                    {name for name in namespace if name.startswith(("Test", "test_"))},
+                    set(exports),
+                )
+
+    def test_failed_source_import_is_not_cached_or_silenced(self):
+        from importlib.machinery import SourceFileLoader
+
+        relative = "unit/test_dsa_prefill_graph_int8.py"
+        before = {name for name in sys.modules if name.startswith("_ppu_pr_legacy_")}
+        with patch.object(
+            SourceFileLoader,
+            "exec_module",
+            side_effect=ModuleNotFoundError("missing SDK"),
+        ):
+            with self.assertRaisesRegex(ModuleNotFoundError, "missing SDK"):
+                self.helper.load_legacy_ppu_module(relative)
+        self.assertEqual(
+            {name for name in sys.modules if name.startswith("_ppu_pr_legacy_")}, before
+        )
+        self.assertTrue(
+            hasattr(
+                self.helper.load_legacy_ppu_module(relative), "TestDsaPrefillGraphInt8"
+            )
+        )
+        with self.assertRaises(FileNotFoundError):
+            self.helper.load_legacy_ppu_module("unit/missing_ci_fixture.py")
+        with self.assertRaises(ValueError):
+            self.helper.load_legacy_ppu_module("../registered/ppu/__init__.py")
+
+
 class SetupContractTest(unittest.TestCase):
     def hardware_jobs(self):
         workflow = yaml.safe_load(

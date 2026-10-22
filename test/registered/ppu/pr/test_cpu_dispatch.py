@@ -9,14 +9,15 @@ import pytest
 from sglang.test.ci.ci_register import register_ppu_ci
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-from ppu.unit.test_deepseek_v4_dspark_quant_metadata import (  # noqa: E402,F401
-    TestDequantSupported,
-    TestDsparkV4QuantMetadata,
-    TestFusedCommitKvProjSupport,
-)
-from ppu.unit.test_dsa_prefill_graph_int8 import (  # noqa: E402,F401
-    TestDsaPrefillGraphInt8,
-)
+from registered.ppu import load_legacy_ppu_module  # noqa: E402
+
+_quant = load_legacy_ppu_module("unit/test_deepseek_v4_dspark_quant_metadata.py")
+TestDequantSupported = _quant.TestDequantSupported
+TestDsparkV4QuantMetadata = _quant.TestDsparkV4QuantMetadata
+TestFusedCommitKvProjSupport = _quant.TestFusedCommitKvProjSupport
+TestDsaPrefillGraphInt8 = load_legacy_ppu_module(
+    "unit/test_dsa_prefill_graph_int8.py"
+).TestDsaPrefillGraphInt8
 
 # The real-import preflight needs the PPU SDK, even though assertions use CPU data.
 register_ppu_ci(est_time=10, suite="stage-b-test-1-gpu-ppu")

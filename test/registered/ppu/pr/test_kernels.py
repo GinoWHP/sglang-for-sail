@@ -9,9 +9,11 @@ import torch
 from sglang.test.ci.ci_register import register_ppu_ci
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-from ppu.unit.test_topk_prefill_bf16_alignment import (  # noqa: E402,F401
-    test_topk_alignment,
-)
+from registered.ppu import load_legacy_ppu_module  # noqa: E402
+
+test_topk_alignment = load_legacy_ppu_module(
+    "unit/test_topk_prefill_bf16_alignment.py"
+).test_topk_alignment
 
 register_ppu_ci(est_time=90, suite="stage-b-kernel-test-1-gpu-ppu")
 
