@@ -1,0 +1,36 @@
+name: PR Review Gate
+
+# Review approval polling is deliberately separated from ci.yaml: the polling
+# job used to keep the whole CI Pipeline concurrency group occupied while it
+# waited for a reviewer, which queued every subsequent authorized PPU run
+# behind human review. This workflow has no hardware work, so
+# cancel-in-progress is safe and required here: an approval-triggered run must
+# replace the stale waiting run instead of queueing behind it.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: review-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  precheck:
+    name: Pre-check
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.review.state == 'approved' && github.event.review.user.type != 'Bot')
+    uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
+
+  human-review:
+    name: Human Review Gate
+    needs: precheck
+    uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
+    secrets: inherit

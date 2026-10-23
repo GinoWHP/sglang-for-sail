@@ -113,6 +113,48 @@ class RunCiWorkflowContractTest(unittest.TestCase):
                     active, group("pull_request_review", 5, state=state, actor=actor)
                 )
 
+    def test_human_review_waits_outside_the_ppu_concurrency_group(self):
+        # A polling approval job inside ci.yaml kept the shared PPU concurrency
+        # group occupied for hours and queued every later authorized run. The
+        # gate must wait in its own workflow with its own group instead.
+        ci_raw = self.read_workflow("ci.yaml")
+        ci = yaml.safe_load(ci_raw)
+        self.assertNotIn("pull_request_review", ci_raw)
+        self.assertNotIn("human-review", ci["jobs"])
+
+        review_raw = self.read_workflow("pr-review-gate.yml")
+        review = yaml.safe_load(review_raw)
+        events = review.get("on", review.get(True))
+        self.assertEqual(events["pull_request_review"]["types"], ["submitted"])
+        self.assertEqual(
+            events["pull_request"]["types"],
+            [
+                "opened",
+                "synchronize",
+                "reopened",
+                "ready_for_review",
+                "converted_to_draft",
+            ],
+        )
+        concurrency = review["concurrency"]
+        self.assertTrue(concurrency["cancel-in-progress"])
+        self.assertIn("review-gate-", concurrency["group"])
+        self.assertNotEqual(concurrency["group"], ci["concurrency"]["group"])
+        job = review["jobs"]["human-review"]
+        self.assertEqual(job["name"], "Human Review Gate")
+        self.assertEqual(job["needs"], "precheck")
+        self.assertEqual(
+            job["uses"], "flytiger-eco/.github/.github/workflows/human-review.yml@main"
+        )
+        # The required check context must stay unique so branch protection
+        # keeps matching the same "Human Review Gate" job name.
+        owners = [
+            p.name
+            for p in (ROOT / ".github/workflows").iterdir()
+            if p.suffix in {".yml", ".yaml"} and "Human Review Gate" in p.read_text()
+        ]
+        self.assertEqual(owners, ["pr-review-gate.yml"])
+
     def test_cpu_precheck_runs_before_label_authorization(self):
         jobs = yaml.safe_load(self.read_workflow("ci.yaml"))["jobs"]
         cpu = jobs["cpu-precheck"]
