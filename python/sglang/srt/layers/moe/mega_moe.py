@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -61,7 +62,7 @@ def _mega_moe_mma_type(experts=None) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
-    if _device_sm < 100:
+    if not _is_ppu and _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
         return None
@@ -136,6 +137,11 @@ def _get_mega_moe_symm_buffer(
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
         if buf is None:
+            mode_kwargs = (
+                {"use_fp8_dispatch": mma_type == "fp8xfp4"}
+                if _is_ppu
+                else {"mma_type": mma_type}
+            )
             buf = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
                 num_experts,
@@ -143,7 +149,7 @@ def _get_mega_moe_symm_buffer(
                 num_topk,
                 hidden,
                 intermediate_hidden,
-                mma_type=mma_type,
+                **mode_kwargs,
                 activation="swiglu",
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
@@ -153,6 +159,8 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if _is_ppu:
+        return _device_sm >= 89
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -399,7 +407,12 @@ def run_mega_routed_experts(
         device=hidden_states.device,
     )
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        deep_gemm.fp8_fp4_mega_moe(
+        mega_moe_kernel = (
+            deep_gemm.fp4_fp4_mega_moe
+            if _is_ppu and mma_type == "mxf4xmxf4"
+            else deep_gemm.fp8_fp4_mega_moe
+        )
+        mega_moe_kernel(
             y,
             experts.mega_l1_weights,
             experts.mega_l2_weights,

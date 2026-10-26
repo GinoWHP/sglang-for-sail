@@ -625,6 +625,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and (
                     get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_megamoe()
                     or get_moe_a2a_backend().is_mooncake()
                     or envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
                 )
@@ -967,6 +968,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # nopad f8f8 kernel compares physical K and asserts
             # m/k/n mismatch (weight K is packed K/2).
             if _is_ppu:
+                if self.use_mega_moe:
+                    if getattr(layer, "_mega_moe_weights_built", False):
+                        return
+                    if self.with_bias:
+                        raise ValueError("PPU MegaMoE does not support expert bias")
+                    from deep_gemm import transform_weights_for_mega_moe
+
+                    # PPU MegaMoE consumes raw uint8 scales, before preprocessing.
+                    l1_pair, l2_pair = transform_weights_for_mega_moe(
+                        (
+                            layer.w13_weight.data,
+                            torch.stack(list(layer.w13_weight_scale)),
+                        ),
+                        (layer.w2_weight.data, torch.stack(list(layer.w2_weight_scale))),
+                    )
+                    layer.mega_l1_weights = l1_pair
+                    layer.mega_l2_weights = l2_pair
+                    layer._mega_moe_weights_built = True
                 if self.with_bias:
                     w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
                     w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
