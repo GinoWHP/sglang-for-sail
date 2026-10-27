@@ -20,10 +20,9 @@ on:
 
 concurrency:
   group: nightly-test-ppu-${{ inputs.ref || github.ref }}
-  # Five serial jobs whose deadlines add up to just under seventeen hours: a
-  # next-day cron or a dispatch arriving mid-ladder would cancel a run that is
-  # still climbing, and the levels it never reached then read as "no verdict"
-  # rather than as a failure. Queue instead, as the Answer callees do.
+  # A cancelled run reports the levels it never reached as "no verdict" rather
+  # than as a failure, so a second dispatch queues behind the one on the boards
+  # instead of replacing it, as the Answer callees do.
   cancel-in-progress: false
 
 permissions:
@@ -35,9 +34,14 @@ permissions:
 # test-ppu-answer.yml and pr-test-ppu.yml do. The container setup lives in
 # scripts/ci/ppu/run_nightly_suite_board.sh; only per-partition values vary here.
 #
-# The chain stays serial: nproc_per_node is a resource request, not device
-# isolation, so two partitions of one board would gate each other in
-# _wait_for_gpu_idle_in_ci.
+# The five levels are independent jobs, as the seven stages of
+# nightly-test-nvidia.yml are: one level failing no longer stops the rest, and
+# the ladder's verdict is settled by finish, which reads every level. A level
+# claims a pod of its own, so the ladder no longer holds one board for most of a
+# day while the board sits idle between levels. nproc_per_node is a resource
+# request, not device isolation, so a level that needs eight PPUs still holds
+# the whole board; run_nightly_suite_board.sh narrows CUDA_VISIBLE_DEVICES to
+# NIGHTLY_DEVICE_COUNT so a one-PPU level cannot gate on its neighbour's memory.
 #
 # The action is pinned to the revision pr-test-ppu.yml uses, not @main, so the
 # nightly ladder does not change mid-series (`uses:` cannot read `env:`).
@@ -150,8 +154,6 @@ jobs:
           retention-days: 30
 
   nightly-1b-ppu:
-    needs: [nightly-1a-ppu]
-    if: always()
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -251,8 +253,6 @@ jobs:
           retention-days: 30
 
   nightly-2-ppu:
-    needs: [nightly-1b-ppu]
-    if: always()
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -345,8 +345,6 @@ jobs:
           retention-days: 30
 
   nightly-4-ppu:
-    needs: [nightly-2-ppu]
-    if: always()
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -439,8 +437,6 @@ jobs:
           retention-days: 30
 
   nightly-8-ppu:
-    needs: [nightly-4-ppu]
-    if: always()
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
