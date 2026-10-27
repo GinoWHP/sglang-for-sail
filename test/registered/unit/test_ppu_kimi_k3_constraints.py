@@ -14,6 +14,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 from sglang.kernels.jit.utils import arch as jit_arch
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.srt.arg_groups import overrides as overrides_module
+from sglang.srt.arg_groups.attention_hook import handle_linear_attn_backend
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear import kda_backend
 from sglang.srt.layers.attention.linear.kernels import kda_flashkda
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
@@ -21,6 +23,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
     CompressedTensorsWNA16DeepGemmMoE,
 )
 from sglang.srt.models import kimi_k3
+from sglang.srt.runtime_context import override_platform
+from sglang.srt.server_args import ServerArgs
 
 
 def test_kda_dispatcher_forces_unsupported_backends_to_triton_on_ppu():
@@ -93,6 +97,8 @@ def test_ppu_flashkda_dispatches_to_platform_operator(extend_kwargs):
     with (
         patch.object(kda_flashkda, "is_ppu", return_value=True),
         patch.object(kda_flashkda, "_load_flash_kda") as load_flash_kda,
+        envs.SGLANG_SAIL_FLA_CUDA.override(True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
         patch.dict(
             sys.modules,
             {
@@ -149,6 +155,8 @@ def test_ppu_flashkda_fallback_preserves_return_contract(
     with (
         patch.object(kda_flashkda, "is_ppu", return_value=True),
         patch.object(kernel, "_flashkda_extend") as fused_extend,
+        envs.SGLANG_SAIL_FLA_CUDA.override(True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
         patch(
             "sglang.kernels.ops.attention.fla.kda.chunk_kda", return_value=result
         ) as chunk_kda,
@@ -208,6 +216,183 @@ def test_ppu_flashkda_only_bypasses_cuda_sequence_length_fallback():
     with patch.object(kda_flashkda, "is_ppu", return_value=False):
         assert kernel._should_fall_back(-5.0, False, short_query_start_loc, [48])
         assert kernel._should_fall_back(-5.0, False, long_query_start_loc, [4096])
+
+
+def test_ppu_pla_prefill_gate_requires_both_sail_gates():
+    with patch.object(kda_flashkda, "is_ppu", return_value=True):
+        with (
+            envs.SGLANG_SAIL_FLA_CUDA.override(True),
+            envs.SGLANG_SAIL_PLA_CUDA.override(True),
+        ):
+            assert kda_flashkda.ppu_pla_prefill_gate_open()
+        with (
+            envs.SGLANG_SAIL_FLA_CUDA.override(True),
+            envs.SGLANG_SAIL_PLA_CUDA.override(False),
+        ):
+            assert not kda_flashkda.ppu_pla_prefill_gate_open()
+        with (
+            envs.SGLANG_SAIL_FLA_CUDA.override(False),
+            envs.SGLANG_SAIL_PLA_CUDA.override(True),
+        ):
+            assert not kda_flashkda.ppu_pla_prefill_gate_open()
+
+    # PLA prefill is PPU-only; other platforms use the flash_kda package.
+    with patch.object(kda_flashkda, "is_ppu", return_value=False):
+        with (
+            envs.SGLANG_SAIL_FLA_CUDA.override(True),
+            envs.SGLANG_SAIL_PLA_CUDA.override(True),
+        ):
+            assert not kda_flashkda.ppu_pla_prefill_gate_open()
+
+
+def test_closed_pla_gate_falls_back_to_triton_on_ppu():
+    kernel = kda_flashkda.FlashKDAKernel()
+    with (
+        patch.object(kda_flashkda, "is_ppu", return_value=True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(False),
+        patch.object(kernel, "_flashkda_extend") as fused_extend,
+        patch(
+            "sglang.kernels.ops.attention.fla.kda.chunk_kda",
+            return_value=sentinel.triton_output,
+        ) as chunk_kda,
+    ):
+        actual = kernel.extend(
+            sentinel.q,
+            sentinel.k,
+            sentinel.v,
+            sentinel.g,
+            sentinel.beta,
+            ssm_states=sentinel.ssm_states,
+            cache_indices=sentinel.cache_indices,
+            query_start_loc=sentinel.query_start_loc,
+            A_log=sentinel.A_log,
+            dt_bias=sentinel.dt_bias,
+            lower_bound=-5.0,
+        )
+
+    assert actual is sentinel.triton_output
+    fused_extend.assert_not_called()
+    chunk_kda.assert_called_once()
+
+
+def _hf_model_config(linear_attn_config):
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(linear_attn_config=linear_attn_config)
+    )
+
+
+def test_ppu_kda_prefill_defaults_to_pla_when_master_gates_on():
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    args = ServerArgs(model_path="dummy")
+    with (
+        override_platform(is_cuda=False, is_sm100=False),
+        patch("sglang.srt.utils.is_ppu", return_value=True),
+        patch(
+            "sglang.srt.arg_groups.attention_hook.model_config_of",
+            return_value=_hf_model_config({"kda_layers": [0, 1]}),
+        ),
+        envs.SGLANG_SAIL_FLA_CUDA.override(True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
+    ):
+        handle_linear_attn_backend(args)
+
+    assert resolved_view(args).linear_attn_prefill_backend == "flashkda"
+    assert args.linear_attn_prefill_backend is None
+
+
+def test_ppu_kda_prefill_stays_triton_when_master_gates_closed():
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    args = ServerArgs(model_path="dummy")
+    with (
+        override_platform(is_cuda=False, is_sm100=False),
+        patch("sglang.srt.utils.is_ppu", return_value=True),
+        patch(
+            "sglang.srt.arg_groups.attention_hook.model_config_of",
+            return_value=_hf_model_config({"kda_layers": [0, 1]}),
+        ),
+        envs.SGLANG_SAIL_FLA_CUDA.override(True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(False),
+    ):
+        handle_linear_attn_backend(args)
+
+    # One master switch turns every PLA path off; prefill keeps Triton.
+    assert resolved_view(args).linear_attn_prefill_backend is None
+
+
+def test_ppu_kda_prefill_requires_both_master_gates():
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    args = ServerArgs(model_path="dummy")
+    with (
+        override_platform(is_cuda=False, is_sm100=False),
+        patch("sglang.srt.utils.is_ppu", return_value=True),
+        patch(
+            "sglang.srt.arg_groups.attention_hook.model_config_of",
+            return_value=_hf_model_config({"kda_layers": [0, 1]}),
+        ),
+        envs.SGLANG_SAIL_FLA_CUDA.override(False),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
+    ):
+        handle_linear_attn_backend(args)
+
+    # Both gates guard the PLA kernels (same pair as decode).
+    assert resolved_view(args).linear_attn_prefill_backend is None
+
+
+def test_ppu_gdn_prefill_is_not_redirected_to_pla():
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    args = ServerArgs(model_path="dummy")
+    with (
+        override_platform(is_cuda=False, is_sm100=False),
+        patch("sglang.srt.utils.is_ppu", return_value=True),
+        patch(
+            "sglang.srt.arg_groups.attention_hook.model_config_of",
+            return_value=_hf_model_config(None),
+        ),
+        envs.SGLANG_SAIL_FLA_CUDA.override(True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
+    ):
+        handle_linear_attn_backend(args)
+
+    # GDN has no PLA FlashKDA kernel; the default must stay Triton.
+    assert resolved_view(args).linear_attn_prefill_backend is None
+
+
+def test_ppu_explicit_prefill_backend_wins_over_the_pla_default():
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    args = ServerArgs(model_path="dummy", linear_attn_prefill_backend="triton")
+    with (
+        override_platform(is_cuda=False, is_sm100=False),
+        patch("sglang.srt.utils.is_ppu", return_value=True),
+        patch(
+            "sglang.srt.arg_groups.attention_hook.model_config_of",
+            return_value=_hf_model_config({"kda_layers": [0, 1]}),
+        ),
+        envs.SGLANG_SAIL_FLA_CUDA.override(True),
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
+    ):
+        handle_linear_attn_backend(args)
+
+    assert resolved_view(args).linear_attn_prefill_backend == "triton"
+
+
+def test_kda_track_path_requests_intermediate_states_only_for_unaligned_rows():
+    from sglang.srt.layers.attention.linear.kda_backend import (
+        needs_intermediate_states,
+    )
+
+    # Chunk-aligned tracked rows snapshot the final state from ssm_states, so
+    # they must not force kernels that only exist on the per-chunk-state path.
+    assert not needs_intermediate_states(True, torch.empty(0, dtype=torch.int64))
+    # Chunk-unaligned tracked rows do read h at the last chunk boundary.
+    assert needs_intermediate_states(True, torch.tensor([3], dtype=torch.int64))
+    # Untracked batches and metadata without h rows never ask for h.
+    assert not needs_intermediate_states(False, torch.tensor([3], dtype=torch.int64))
+    assert not needs_intermediate_states(True, None)
 
 
 def _fused_decode_coverage_inputs(num_heads):
