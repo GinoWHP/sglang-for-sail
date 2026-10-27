@@ -7,10 +7,13 @@
 # environment:
 #   NIGHTLY_SUITE            registered suite name for run_suite.py
 #   NIGHTLY_DEVICE_COUNT     PPUs to expose; must equal nproc_per_node
+#   NIGHTLY_TIMEOUT_PER_FILE seconds run_suite.py gives each registered file
 #   NIGHTLY_WARM_MODELS      '|'-separated checkpoints to page-warm first
 #   NIGHTLY_PARTITION_ID     LPT partition to run; omit to run the whole suite
 #   NIGHTLY_PARTITION_SIZE   number of partitions the suite is cut into
 #   NIGHTLY_MARLIN_PRELOAD   "true" to compile the Marlin JIT before the suite
+#   NIGHTLY_RESULTS_DIR      pod-side path to copy the suite log to; the runner
+#                            reads the same bytes through the /mnt/wl_nas view
 #
 # Lists are '|'-separated because the action's `extra_env` is a comma-separated
 # KEY=VALUE list.
@@ -26,6 +29,16 @@ PIPEOF
 
 : "${NIGHTLY_SUITE:?the registered suite name is required}"
 : "${NIGHTLY_DEVICE_COUNT:?the device count is required}"
+: "${NIGHTLY_TIMEOUT_PER_FILE:?the per-file timeout is required}"
+
+# The action carries no files out of the pod, only its logs, so the copy travels
+# over the NAS both sides mount. A missing destination costs the archive, not
+# the verdict: the suite still runs and still decides the job.
+results_dir="${NIGHTLY_RESULTS_DIR:-}"
+if [ -n "$results_dir" ] && ! mkdir -p "$results_dir"; then
+  echo "WARN: cannot create $results_dir; the results will not be archived"
+  results_dir=""
+fi
 
 # Constant for every partition, so they are not repeated in each job.
 # run_answer_suite_board.sh records the measurements behind the PPU/SGLANG_*
@@ -35,7 +48,7 @@ export CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include
 export HF_HUB_OFFLINE=1
 export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
 export PPU_SUPPORTS_FP8=0
-export SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels
+export SGL_KERNEL_WHEEL_CACHE_DIR=/mnt/wl_nas/cache/sgl-kernel-wheels
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 export SGLANG_SAIL_PLA_CUDA=0
 
@@ -82,9 +95,30 @@ args=(
   --suite "${NIGHTLY_SUITE}"
   --nightly
   --continue-on-error
+  --timeout-per-file "${NIGHTLY_TIMEOUT_PER_FILE}"
 )
 if [ -n "${NIGHTLY_PARTITION_ID:-}" ]; then
   : "${NIGHTLY_PARTITION_SIZE:?the partition size is required with a partition id}"
   args+=(--auto-partition-id "${NIGHTLY_PARTITION_ID}" --auto-partition-size "${NIGHTLY_PARTITION_SIZE}")
 fi
-python3 run_suite.py "${args[@]}"
+
+if [ -z "$results_dir" ]; then
+  python3 run_suite.py "${args[@]}"
+  exit
+fi
+
+# What ran, so the artifact answers "which set was this" without the job log.
+{
+  echo "suite=${NIGHTLY_SUITE}"
+  echo "visible_devices=${CUDA_VISIBLE_DEVICES}"
+  echo "device_count=${NIGHTLY_DEVICE_COUNT}"
+  echo "partition=${NIGHTLY_PARTITION_ID:-none}/${NIGHTLY_PARTITION_SIZE:-none}"
+  echo "timeout_per_file=${NIGHTLY_TIMEOUT_PER_FILE}"
+  echo "marlin_preload=${NIGHTLY_MARLIN_PRELOAD:-false}"
+  echo "source_revision=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+} > "${results_dir}/suite.txt" ||
+  echo "WARN: cannot write ${results_dir}/suite.txt; the archive will lack its manifest"
+
+# tee keeps the live log on the run page; pipefail keeps the suite's verdict.
+set -o pipefail
+python3 run_suite.py "${args[@]}" 2>&1 | tee "${results_dir}/run.log"
